@@ -86,6 +86,62 @@ def load_modules_from_excel():
 # 加载组件参数库
 LONGI_MODULES = load_modules_from_excel()
 
+# 从Excel文件加载站点参数
+STATIONS_EXCEL_PATH = os.path.join(os.path.dirname(__file__), '站点参数库.xlsx')
+
+def load_stations_from_excel():
+    """从Excel文件加载站点参数库"""
+    try:
+        if not os.path.exists(STATIONS_EXCEL_PATH):
+            # 如果文件不存在，创建默认Excel文件
+            st.warning(f"⚠️ 未找到站点参数文件，正在创建默认文件: {STATIONS_EXCEL_PATH}")
+            default_data = {
+                '站点名称': ['荣拓', '丰泰'],
+                '经度': [113.2, 114.1],
+                '纬度': [23.4, 22.8],
+                '海拔': [91.46, 50.0],
+                '容量': [10.0, 20.0],
+                '光伏组件': ['LONGi LR5-72HPH-550M (550W)', 'LONGi LR5-72HPH-560M (560W)'],
+                '不确定系数': [0.8, 0.8]
+            }
+            default_df = pd.DataFrame(default_data)
+            default_df.to_excel(STATIONS_EXCEL_PATH, index=False, engine='openpyxl')
+            st.success(f"✅ 已创建默认站点参数文件，正在重新加载...")
+            # 重新加载刚创建的文件
+            df_stations = pd.read_excel(STATIONS_EXCEL_PATH, engine='openpyxl')
+        else:
+            # 读取Excel文件
+            df_stations = pd.read_excel(STATIONS_EXCEL_PATH, engine='openpyxl')
+        
+        # 转换为字典格式
+        stations_dict = {}
+        for idx, row in df_stations.iterrows():
+            station_name = row['站点名称']
+            module_name = row.get('光伏组件', '')
+            
+            # 验证组件型号是否在组件库中存在
+            if module_name and module_name not in LONGI_MODULES:
+                st.warning(f"⚠️ 站点'{station_name}'的组件'{module_name}'不在组件库中，将使用默认组件")
+                module_name = 'LONGi LR5-72HPH-550M (550W)'
+            
+            stations_dict[station_name] = {
+                'longitude': float(row['经度']),
+                'latitude': float(row['纬度']),
+                'altitude': float(row['海拔']),
+                'capacity': float(row['容量']),
+                'module': module_name if module_name else 'LONGi LR5-72HPH-550M (550W)',
+                'uncertainty_factor': float(row.get('不确定系数', 0.8))
+            }
+        
+        return stations_dict
+        
+    except Exception as e:
+        st.error(f"❌ 加载站点参数失败: {str(e)}")
+        return {}
+
+# 加载站点参数库
+STATIONS = load_stations_from_excel()
+
 # 初始化session_state中的组件参数（首次运行时）
 if 'module_power' not in st.session_state:
     st.session_state['module_power'] = 550.0
@@ -102,14 +158,82 @@ st.markdown("基于Streamlit和PVlib ModelChain的专业光伏发电量分析平
 # 创建侧边栏
 with st.sidebar:
     st.header("⚙️ 系统参数配置")
+    
+    # 站点选择
+    st.subheader("🏭 站点选择")
+    
+    # 定义回调函数：当站点选择改变时更新参数
+    def update_station_params():
+        selected_station = st.session_state['station_selector']
+        if selected_station in STATIONS:
+            params = STATIONS[selected_station]
+            st.session_state['station_longitude'] = params['longitude']
+            st.session_state['station_latitude'] = params['latitude']
+            st.session_state['station_altitude'] = params['altitude']
+            st.session_state['station_capacity'] = params['capacity']
+            st.session_state['station_uncertainty_factor'] = params.get('uncertainty_factor', 0.8)
+            # 如果站点指定了组件，且该组件在组件库中，则更新组件选择和参数
+            if params['module'] in LONGI_MODULES:
+                st.session_state['module_selector'] = params['module']
+                # 直接更新组件参数
+                comp_params = LONGI_MODULES[params['module']]
+                st.session_state['module_power'] = comp_params['pdc0']
+                st.session_state['module_voc'] = comp_params['Voc']
+                st.session_state['module_isc'] = comp_params['Isc']
+                st.session_state['module_vmp'] = comp_params['Vmp']
+                st.session_state['module_imp'] = comp_params['Imp']
+                st.success(f"✅ 已自动选择组件: {params['module']}")
+            else:
+                st.warning(f"⚠️ 站点'{selected_station}'的组件'{params['module']}'不在组件库中，请手动选择组件")
+    
+    # 站点选择下拉框
+    station_selector = st.selectbox(
+        "选择站点",
+        options=["自定义"] + list(STATIONS.keys()),
+        index=0,  # 默认选择自定义
+        key='station_selector',
+        on_change=update_station_params,
+        help="选择预设站点或自定义输入"
+    )
+    
+    # 显示站点信息
+    if station_selector in STATIONS:
+        station_info = STATIONS[station_selector]
+        st.info(f"📍 经度: {station_info['longitude']} | 纬度: {station_info['latitude']}\n🏔️ 海拔: {station_info['altitude']}m | ⚡ 容量: {station_info['capacity']}kW")
 
     st.subheader("📍 地理位置")
-    latitude = st.number_input("纬度 (°N)", value=23.4, min_value=-90.0, max_value=90.0)
-    longitude = st.number_input("经度 (°E)", value=113.2, min_value=-180.0, max_value=180.0)
-    altitude = st.number_input("海拔 (m)", value=91.46, min_value=0.0)
+    
+    # 根据站点选择决定输入框是否可编辑
+    is_custom = station_selector == "自定义"
+    
+    latitude = st.number_input(
+        "纬度 (°N)", 
+        value=st.session_state.get('station_latitude', 23.4) if not is_custom else 23.4, 
+        min_value=-90.0, 
+        max_value=90.0,
+        disabled=not is_custom
+    )
+    longitude = st.number_input(
+        "经度 (°E)", 
+        value=st.session_state.get('station_longitude', 113.2) if not is_custom else 113.2, 
+        min_value=-180.0, 
+        max_value=180.0,
+        disabled=not is_custom
+    )
+    altitude = st.number_input(
+        "海拔 (m)", 
+        value=st.session_state.get('station_altitude', 91.46) if not is_custom else 91.46, 
+        min_value=0.0,
+        disabled=not is_custom
+    )
 
     st.subheader("🔧 光伏系统参数")
-    system_capacity = st.number_input("系统容量 (kW)", value=10.0, min_value=0.1)
+    system_capacity = st.number_input(
+        "系统容量 (kW)", 
+        value=st.session_state.get('station_capacity', 10.0) if not is_custom else 10.0, 
+        min_value=0.1,
+        disabled=not is_custom
+    )
     tilt_angle = st.number_input("倾角 (°)", value=30, min_value=0, max_value=90)
     azimuth = st.number_input("方位角 (°)", value=180, min_value=0, max_value=360)
     albedo = st.number_input("反照率", value=0.2, min_value=0.0, max_value=1.0)
@@ -133,6 +257,7 @@ with st.sidebar:
             st.session_state['module_isc'] = params['Isc']
             st.session_state['module_vmp'] = params['Vmp']
             st.session_state['module_imp'] = params['Imp']
+            st.success(f"✅ 组件参数已更新: {selected_module}")
     
     # 组件选择下拉框
     module_selector = st.selectbox(
@@ -188,9 +313,16 @@ with st.sidebar:
     else:
         inv_power = system_capacity
 
-    # 不确定系数
+    # 不确定系数（由站点决定）
     st.subheader("📊 不确定系数")
-    uncertainty_factor = st.number_input("不确定系数", value=0.8, min_value=0.0, max_value=1.0, step=0.05)
+    uncertainty_factor = st.number_input(
+        "不确定系数", 
+        value=st.session_state.get('station_uncertainty_factor', 0.8) if not is_custom else 0.8, 
+        min_value=0.0, 
+        max_value=1.0, 
+        step=0.05,
+        disabled=not is_custom
+    )
 
     # 保存参数到session state
     st.session_state['config'] = {
@@ -421,88 +553,234 @@ with module_tab:
         )
         
         st.info("💡 下载模板后，按照格式填写您的组件参数，然后上传即可")
+    
+    # ========== 站点参数管理 ==========
+    st.markdown("---")
+    st.markdown("## 🏭 站点参数管理")
+    
+    # 显示当前站点库信息
+    st.info(f"📊 当前站点库包含 **{len(STATIONS)}** 个站点")
+    
+    # 上传站点参数Excel文件
+    st.markdown("#### 📤 上传站点参数文件")
+    
+    uploaded_station_file = st.file_uploader(
+        "选择站点参数Excel文件 (.xlsx)",
+        type=['xlsx'],
+        key='station_data_upload',
+        help="Excel文件需包含列：站点名称、经度、纬度、海拔、容量、光伏组件"
+    )
+    
+    if uploaded_station_file is not None:
+        try:
+            # 读取Excel文件
+            df_new_stations = pd.read_excel(uploaded_station_file, engine='openpyxl')
+            
+            # 检查必要的列
+            required_columns = ['站点名称', '经度', '纬度', '海拔', '容量']
+            missing_columns = [col for col in required_columns if col not in df_new_stations.columns]
+            
+            if missing_columns:
+                st.error(f"❌ Excel文件缺少必要的列: {', '.join(missing_columns)}")
+                st.info(f"💡 必需的列名: {', '.join(required_columns)}")
+            else:
+                # 显示预览
+                st.success(f"✅ 文件读取成功！检测到 **{len(df_new_stations)}** 个站点")
+                
+                with st.expander("📊 预览上传的数据"):
+                    st.dataframe(df_new_stations)
+                
+                # 选择合并模式
+                station_merge_mode = st.radio(
+                    "选择合并模式",
+                    ["追加到现有库", "替换整个站点库"],
+                    key='station_merge_mode',
+                    help="追加：保留现有站点，添加新站点\n替换：删除所有现有站点，只使用上传的站点"
+                )
+                
+                # 确认按钮
+                if st.button("📥 导入站点参数", type="primary", key='import_stations_btn'):
+                    try:
+                        if station_merge_mode == "追加到现有库":
+                            # 追加模式：合并现有站点和新站点
+                            existing_df = pd.DataFrame([
+                                {'站点名称': name, **params}
+                                for name, params in STATIONS.items()
+                            ])
+                            # 重命名列以匹配格式
+                            existing_df = existing_df.rename(columns={
+                                'longitude': '经度',
+                                'latitude': '纬度',
+                                'altitude': '海拔',
+                                'capacity': '容量',
+                                'module': '光伏组件'
+                            })
+                            
+                            # 合并并去重（以站点名称为准）
+                            combined_df = pd.concat([existing_df, df_new_stations], ignore_index=True)
+                            combined_df = combined_df.drop_duplicates(subset=['站点名称'], keep='last')
+                            
+                            # 保存为Excel
+                            combined_df.to_excel(STATIONS_EXCEL_PATH, index=False, engine='openpyxl')
+                            st.success(f"✅ 成功追加 {len(df_new_stations)} 个站点！站点库现包含 {len(combined_df)} 个站点")
+                        else:
+                            # 替换模式：只保存新上传的站点
+                            df_new_stations.to_excel(STATIONS_EXCEL_PATH, index=False, engine='openpyxl')
+                            st.success(f"✅ 成功替换站点库！现包含 {len(df_new_stations)} 个站点")
+                        
+                        st.warning("⚠️ 请刷新页面以加载新的站点参数")
+                        
+                    except Exception as save_error:
+                        st.error(f"❌ 保存文件失败: {str(save_error)}")
+                
+        except Exception as e:
+            st.error(f"❌ 读取Excel文件失败: {str(e)}")
+    
+    # 下载站点模板
+    st.markdown("#### 📋 下载站点参数模板")
+    
+    if st.button("📥 下载站点参数模板", key='download_station_template_btn'):
+        # 创建模板DataFrame
+        template_data = {
+            '站点名称': ['示例站点'],
+            '经度': [113.2],
+            '纬度': [23.4],
+            '海拔': [91.46],
+            '容量': [10.0],
+            '光伏组件': ['LONGi LR5-72HPH-550M (550W)'],
+            '不确定系数': [0.8]
+        }
+        template_df = pd.DataFrame(template_data)
+        
+        # 转换为Excel字节流
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            template_df.to_excel(writer, index=False, sheet_name='站点参数')
+        output.seek(0)
+        
+        # 提供下载
+        st.download_button(
+            label="⬇️ 下载站点模板.xlsx",
+            data=output,
+            file_name="站点参数模板.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key='download_station_template'
+        )
+        
+        st.info("💡 下载模板后，按照格式填写您的站点参数，然后上传即可")
 
 with forecast_tab:
     st.header("🔮 光伏出力预测 (基于天气预报)")
     
-    if 'config' not in st.session_state:
+    if not STATIONS:
+        st.warning("⚠️ 请先在\"🔆 组件参数管理\"选项卡中添加站点参数")
+    elif 'config' not in st.session_state:
         st.warning("⚠️ 请先在侧边栏设置系统参数（经纬度、组件型号等）")
     else:
         st.markdown("""
-        本功能将根据您设置的**地理位置**和**系统参数**，结合在线天气预报数据（Open-Meteo），
-        对未来 **7天** 的光伏发电功率进行预测。
+        本功能将根据您选择的**站点**，结合在线天气预报数据（Open-Meteo），
+        对未来指定天数的光伏发电功率进行预测。支持同时预测多个站点。
         """)
         
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            predict_btn = st.button("🚀 开始获取天气并预测", type="primary")
+        # 添加站点选择器（支持多选）
+        st.subheader("🏭 选择预测站点")
+        selected_stations = st.multiselect(
+            "选择要预测的站点（可多选）",
+            options=list(STATIONS.keys()),
+            default=[list(STATIONS.keys())[0]] if STATIONS else [],
+            help="按住 Ctrl 键可多选站点"
+        )
         
-        if predict_btn:
-            try:
-                import requests
-                config = st.session_state['config']
+        if selected_stations:
+            # 添加预测天数选择器
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                predict_btn = st.button("🚀 开始获取天气并预测", type="primary")
+            with col2:
+                forecast_days = st.slider("预测天数", min_value=1, max_value=7, value=3, step=1, 
+                                          help="选择要预测的天数（1-7天）",
+                                          key="forecast_days_slider")
+            
+            # 将预测天数和站点保存到 session_state
+            st.session_state['forecast_days'] = forecast_days
+            st.session_state['selected_stations'] = selected_stations
+            
+            if predict_btn:
+                all_results = {}
                 
-                with st.spinner("正在从 Open-Meteo 获取天气预报数据..."):
-                    # 获取当前时间到未来7天的预报
-                    start = pd.Timestamp.now(tz='Asia/Shanghai')
-                    end = start + pd.Timedelta(days=7)
+                # 对每个选中的站点进行预测
+                for station_idx, station_name in enumerate(selected_stations):
+                    station_info = STATIONS[station_name]
                     
-                    lat = config['location']['latitude']
-                    lon = config['location']['longitude']
-                    
-                    # 使用 Open-Meteo API 获取天气预报数据（免费、无需API Key、国内可用）
-                    url = (
-                        f"https://api.open-meteo.com/v1/forecast?"
-                        f"latitude={lat}&longitude={lon}"
-                        f"&hourly=shortwave_radiation,direct_radiation,diffuse_radiation,"
-                        f"temperature_2m,wind_speed_10m,cloud_cover"
-                        f"&timezone=Asia%2FShanghai"
-                        f"&forecast_days=7"
-                    )
-                    
-                    response = requests.get(url, timeout=30)
-                    response.raise_for_status()
-                    weather_json = response.json()
-                    
-                    # 解析数据
-                    hourly = weather_json['hourly']
-                    times = pd.to_datetime(hourly['time']).tz_localize('Asia/Shanghai')
-                    
-                    raw_data = pd.DataFrame({
-                        'ghi': hourly['shortwave_radiation'],       # 总水平辐射 (W/m2)
-                        'dni': hourly['direct_radiation'],           # 直接辐射 (W/m2)
-                        'dhi': hourly['diffuse_radiation'],          # 散射辐射 (W/m2)
-                        'temp_air': hourly['temperature_2m'],        # 气温 (°C)
-                        'wind_speed': hourly['wind_speed_10m'],      # 风速 (km/h)
-                    }, index=times)
-                    
-                    # 风速单位转换：km/h -> m/s
-                    raw_data['wind_speed'] = raw_data['wind_speed'] / 3.6
-                    
-                    if raw_data.empty:
-                        st.error("❌ 未能获取到该地点的天气预报数据，请检查经纬度是否正确。")
-                    else:
-                        st.success(f"✅ 成功获取未来 {len(raw_data)} 小时的预报数据！")
-                        
-                        # 准备 ModelChain 计算
-                        with st.spinner("正在进行光伏建模预测..."):
+                    with st.spinner(f"正在预测站点 {station_idx + 1}/{len(selected_stations)}: {station_name}..."):
+                        try:
+                            import requests
+                            
+                            lat = station_info['latitude']
+                            lon = station_info['longitude']
+                            altitude = station_info['altitude']
+                            capacity = station_info['capacity']
+                            module_name = station_info['module']
+                            
+                            # 获取组件参数
+                            if module_name in LONGI_MODULES:
+                                comp_params = LONGI_MODULES[module_name]
+                            else:
+                                st.warning(f"⚠️ 站点'{station_name}'的组件不在库中，使用默认参数")
+                                comp_params = LONGI_MODULES.get('LONGi LR5-72HPH-550M (550W)', {})
+                            
+                            # 使用 Open-Meteo API 获取天气预报数据
+                            url = (
+                                f"https://api.open-meteo.com/v1/forecast?"
+                                f"latitude={lat}&longitude={lon}"
+                                f"&hourly=shortwave_radiation,direct_radiation,diffuse_radiation,"
+                                f"temperature_2m,wind_speed_10m,cloud_cover"
+                                f"&timezone=Asia%2FShanghai"
+                                f"&forecast_days={forecast_days}"
+                            )
+                            
+                            response = requests.get(url, timeout=30)
+                            response.raise_for_status()
+                            weather_json = response.json()
+                            
+                            # 解析数据
+                            hourly = weather_json['hourly']
+                            times = pd.to_datetime(hourly['time']).tz_localize('Asia/Shanghai')
+                            
+                            raw_data = pd.DataFrame({
+                                'ghi': hourly['shortwave_radiation'],
+                                'dni': hourly['direct_radiation'],
+                                'dhi': hourly['diffuse_radiation'],
+                                'temp_air': hourly['temperature_2m'],
+                                'wind_speed': hourly['wind_speed_10m'],
+                                'cloud_cover': hourly.get('cloud_cover', [0]*len(times)),
+                            }, index=times)
+                            
+                            # 风速单位转换：km/h -> m/s
+                            raw_data['wind_speed'] = raw_data['wind_speed'] / 3.6
+                            
+                            if raw_data.empty:
+                                st.error(f"❌ 站点'{station_name}'未能获取到天气预报数据")
+                                continue
+                            
+                            # 准备 ModelChain 计算
                             location = Location(
                                 latitude=lat,
                                 longitude=lon,
-                                altitude=config['location']['altitude'],
+                                altitude=altitude,
                                 tz='Asia/Shanghai'
                             )
                             
                             module_parameters = {
-                                'pdc0': config['system']['module_power'],
-                                'gamma_pdc': config['system']['gamma_pdc'],
-                                'Vmpo': config['system']['Vmp'],
-                                'Impo': config['system']['Imp'],
-                                'Voc': config['system']['Voc'],
-                                'Isc': config['system']['Isc'],
+                                'pdc0': comp_params.get('pdc0', 550.0),
+                                'gamma_pdc': st.session_state['config']['system']['gamma_pdc'],
+                                'Vmpo': comp_params.get('Vmp', 41.95),
+                                'Impo': comp_params.get('Imp', 13.12),
+                                'Voc': comp_params.get('Voc', 49.80),
+                                'Isc': comp_params.get('Isc', 13.98),
                             }
                             
-                            inv_power_w = config['system']['inverter_power'] * 1000
+                            inv_power_w = capacity * 1000
                             inverter_parameters = {
                                 'Paco': inv_power_w,
                                 'pdc0': inv_power_w,
@@ -515,15 +793,15 @@ with forecast_tab:
                                 'Pacmax': inv_power_w,
                             }
                             
-                            num_modules = int(np.ceil(config['system']['capacity_kw'] * 1000 / module_parameters['pdc0']))
+                            num_modules = int(np.ceil(capacity * 1000 / module_parameters['pdc0']))
                             system = PVSystem(
-                                surface_tilt=config['system']['tilt'],
-                                surface_azimuth=config['system']['azimuth'],
+                                surface_tilt=st.session_state['config']['system']['tilt'],
+                                surface_azimuth=st.session_state['config']['system']['azimuth'],
                                 module_parameters=module_parameters,
                                 inverter_parameters=inverter_parameters,
                                 modules_per_string=num_modules,
                                 strings_per_inverter=1,
-                                temperature_model_parameters=TEMPERATURE_MODEL_PARAMETERS['sapm'][config['system']['temp_model']]
+                                temperature_model_parameters=TEMPERATURE_MODEL_PARAMETERS['sapm'][st.session_state['config']['system']['temp_model']]
                             )
                             
                             mc = ModelChain(
@@ -544,85 +822,130 @@ with forecast_tab:
                             
                             # 整理预测结果
                             forecast_df = pd.DataFrame({
+                                '预测时间': raw_data.index,
                                 'GHI (W/m²)': raw_data['ghi'],
+                                'DNI (W/m²)': raw_data['dni'],
+                                'DHI (W/m²)': raw_data['dhi'],
+                                '气温 (°C)': raw_data['temp_air'],
+                                '风速 (m/s)': raw_data['wind_speed'],
+                                '云量 (%)': raw_data['cloud_cover'],
                                 '直流功率 (kW)': dc_power / 1000,
                                 '交流功率 (kW)': results.ac / 1000
-                            }, index=raw_data.index.tz_convert('Asia/Shanghai'))
+                            })
                             
-                            forecast_df.index.name = '预测时间'
+                            forecast_df.set_index('预测时间', inplace=True)
                             
-                            # 过滤掉当前时间之前的数据（只显示未来预测）
+                            # 过滤掉当前时间之前的数据
                             current_time = pd.Timestamp.now(tz='Asia/Shanghai')
                             forecast_df = forecast_df[forecast_df.index >= current_time]
                             
-                            st.session_state['forecast_results'] = forecast_df
-                            st.success("✅ 预测完成！请查看下方图表。")
-            
-            except ImportError as ie:
-                st.error("❌ 导入模块失败，请检查以下依赖是否已安装：")
-                st.code("pip install pvlib netCDF4 xarray siphon")
-                st.info(f"🔍 详细错误: {str(ie)}")
+                            all_results[station_name] = forecast_df
+                            
+                        except Exception as e:
+                            st.error(f"❌ 站点'{station_name}'预测失败: {str(e)}")
                 
-                # 检查 pvlib 版本
-                import pvlib
-                st.info(f"📦 当前 pvlib 版本: {pvlib.__version__}")
-                if pvlib.__version__ < '0.9.0':
-                    st.warning("⚠️ pvlib 版本过低，请升级: `pip install --upgrade pvlib`")
-            except Exception as e:
-                st.error(f"❌ 预测过程中发生错误: {str(e)}")
-                with st.expander("🔍 查看详细错误堆栈"):
-                    st.exception(e)
-        
-        # 将绘图和选择器代码移到条件块外，确保切换选择器时能正常显示
-        if 'forecast_results' in st.session_state:
-            forecast_df = st.session_state['forecast_results']
-            config = st.session_state['config']
+                # 保存所有站点的结果
+                if all_results:
+                    st.session_state['forecast_multi_results'] = all_results
+                    st.success(f"✅ 成功完成 {len(all_results)} 个站点的预测！请查看下方图表。")
             
-            # 绘图展示
-            st.subheader("📈 未来7天功率预测曲线")
-            
-            # 添加曲线类型选择器
-            curve_type = st.radio("选择展示曲线", ["交流功率", "直流功率"], horizontal=True, key="forecast_curve_type")
-            
-            # 根据选择确定数据列和颜色
-            if curve_type == "交流功率":
-                col_name = '交流功率 (kW)'
-                color = '#FF9800'
-                label = '预测交流功率'
-            else:
-                col_name = '直流功率 (kW)'
-                color = '#2196F3'
-                label = '预测直流功率'
+            # 显示多站点预测结果
+            if 'forecast_multi_results' in st.session_state:
+                multi_results = st.session_state['forecast_multi_results']
+                forecast_days_display = st.session_state.get('forecast_days', 3)
                 
-            fig, ax = plt.subplots(figsize=(14, 6))
-            ax.plot(forecast_df.index, forecast_df[col_name], label=label, color=color, linewidth=2)
-            ax.set_xlabel('时间', fontsize=12)
-            ax.set_ylabel('功率 (kW)', fontsize=12)
-            ax.set_title(f'光伏发电功率预测 ({config["system"]["module_name"]})', fontsize=14)
-            ax.legend()
-            ax.grid(True, linestyle='--', alpha=0.6)
-            plt.xticks(rotation=45)
-            st.pyplot(fig)
-            
-            # 预测数据统计
-            st.subheader("📊 预测数据概览")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("预计总发电量 (kWh)", f"{forecast_df[col_name].sum():.1f}")
-            c2.metric("峰值功率 (kW)", f"{forecast_df[col_name].max():.2f}")
-            c3.metric("平均功率 (kW)", f"{forecast_df[col_name].mean():.2f}")
-            
-            with st.expander("📋 查看详细预测数据"):
-                # 显示时将索引重置为列，方便查看
-                st.dataframe(forecast_df.reset_index())
-                
-                # 提供下载
-                csv = forecast_df.reset_index().to_csv(index=False).encode('utf-8-sig')
-                st.download_button(
-                    label="⬇️ 下载预测结果 CSV",
-                    data=csv,
-                    file_name=f"光伏预测_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
+                # 为每个站点显示结果
+                for station_name, forecast_df in multi_results.items():
+                    st.divider()
+                    st.subheader(f"📍 站点: {station_name}")
+                    
+                    # 绘图展示
+                    st.subheader(f"📈 未来 {forecast_days_display} 天功率预测曲线")
+                    
+                    # 添加曲线类型选择器
+                    curve_type_key = f"forecast_curve_type_{station_name}"
+                    curve_type = st.radio(
+                        "选择展示曲线", 
+                        ["交流功率", "直流功率"], 
+                        horizontal=True, 
+                        key=curve_type_key
+                    )
+                    
+                    # 根据选择确定数据列和颜色
+                    if curve_type == "交流功率":
+                        col_name = '交流功率 (kW)'
+                        color = '#FF9800'
+                        label = '预测交流功率'
+                    else:
+                        col_name = '直流功率 (kW)'
+                        color = '#2196F3'
+                        label = '预测直流功率'
+                        
+                    fig, ax = plt.subplots(figsize=(14, 6))
+                    ax.plot(forecast_df.index, forecast_df[col_name], label=label, color=color, linewidth=2)
+                    ax.set_xlabel('时间', fontsize=12)
+                    ax.set_ylabel('功率 (kW)', fontsize=12)
+                    ax.set_title(f'{station_name} - 光伏发电功率预测', fontsize=14)
+                    ax.legend()
+                    ax.grid(True, linestyle='--', alpha=0.6)
+                    plt.xticks(rotation=45)
+                    st.pyplot(fig)
+                    
+                    # 预测数据统计
+                    st.subheader("📊 预测数据概览")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("预计总发电量 (kWh)", f"{forecast_df[col_name].sum():.1f}")
+                    c2.metric("峰值功率 (kW)", f"{forecast_df[col_name].max():.2f}")
+                    c3.metric("平均功率 (kW)", f"{forecast_df[col_name].mean():.2f}")
+                    
+                    # 获取站点不确定系数
+                    uncertainty = station_info.get('uncertainty_factor', 0.8)
+                    
+                    # 按日统计数据
+                    st.subheader(f"📅 每日发电量统计 (不确定系数: {uncertainty})")
+                    daily_stats = forecast_df[col_name].resample('D').agg(
+                        每日发电量_kWh=('sum'),
+                        每日平均功率_kW=('mean')
+                    ).round(2)
+                    
+                    # 添加考虑不确定系数后的发电量
+                    daily_stats['考虑不确定系数后_每日发电量_kWh'] = (daily_stats['每日发电量_kWh'] * uncertainty).round(2)
+                    
+                    # 将索引转换为列并重命名
+                    daily_stats = daily_stats.reset_index()
+                    daily_stats.columns = ['日期', '每日发电量_kWh', '每日平均功率_kW', '考虑不确定系数后_每日发电量_kWh']
+                    
+                    # 格式化日期显示
+                    daily_stats['日期'] = daily_stats['日期'].dt.strftime('%Y-%m-%d')
+                    
+                    # 显示每日统计表格
+                    st.dataframe(daily_stats, use_container_width=True, hide_index=True)
+                    
+                    # 提供每日统计下载
+                    daily_csv = daily_stats.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        label=f"⬇️ 下载 {station_name} 每日统计数据",
+                        data=daily_csv,
+                        file_name=f"{station_name}_每日发电统计_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv"
+                    )
+                    
+                    with st.expander("📋 查看详细预测数据"):
+                        # 去掉时区信息，格式化时间显示
+                        display_df = forecast_df.reset_index().copy()
+                        display_df['预测时间'] = display_df['预测时间'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        
+                        # 提供下载
+                        csv = display_df.to_csv(index=False).encode('utf-8-sig')
+                        st.download_button(
+                            label=f"⬇️ 下载 {station_name} 预测结果 CSV",
+                            data=csv,
+                            file_name=f"光伏预测_{station_name}_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv"
+                        )
+        else:
+            st.info("💡 请至少选择一个站点进行预测")
 
 with calc_tab:
     st.header("🚀 ModelChain光伏建模计算")
@@ -1296,7 +1619,7 @@ with export_tab:
 
 # 页脚
 st.divider()
-st.caption("© 2024 光伏发电量分析工具 | 基于Streamlit和PVlib ModelChain构建")
+st.caption("© 2026 光伏发电量分析工具 | 基于Streamlit和PVlib ModelChain构建")
 
 # 使用说明
 with st.expander("ℹ️ 使用说明"):
