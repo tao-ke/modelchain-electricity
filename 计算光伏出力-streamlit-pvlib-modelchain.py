@@ -24,13 +24,40 @@ st.set_page_config(
 )
 
 
-
-# 设置中文字体
+# 设置中文字体（兼容Streamlit Cloud）
 def setup_chinese_font():
-    """设置中文字体支持"""
+    """设置中文字体支持，兼容Windows本地和Streamlit Cloud"""
+    import matplotlib.font_manager as fm
+    
+    # 重置默认配置
     matplotlib.rcParams.update(matplotlib.rcParamsDefault)
-    matplotlib.rcParams['font.family'] = ['DejaVu Sans', 'Microsoft YaHei', 'SimHei', 'sans-serif']
+    
+    # 方案1：尝试从项目目录加载字体文件（适用于Streamlit Cloud）
+    font_path = os.path.join(os.path.dirname(__file__), 'SimHei.ttf')
+    if os.path.exists(font_path):
+        try:
+            font_prop = fm.FontProperties(fname=font_path)
+            matplotlib.rcParams['font.family'] = font_prop.get_name()
+            matplotlib.rcParams['axes.unicode_minus'] = False
+            st.info("✅ 已加载项目目录中的中文字体 (SimHei.ttf)")
+            return font_prop.get_name()
+        except Exception:
+            pass
+    
+    # 方案2：尝试系统已安装的中文字体（适用于本地Windows）
+    available_fonts = [f.name for f in fm.fontManager.ttflist]
+    chinese_fonts = ['SimHei', 'Microsoft YaHei', 'Microsoft JhengHei', 'PingFang SC', 'WenQuanYi Micro Hei']
+    
+    for font_name in chinese_fonts:
+        if font_name in available_fonts:
+            matplotlib.rcParams['font.family'] = font_name
+            matplotlib.rcParams['axes.unicode_minus'] = False
+            return font_name
+    
+    # 方案3：使用DejaVu Sans（英文字体，不会出现乱码方块，但中文可能不显示）
+    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
     matplotlib.rcParams['axes.unicode_minus'] = False
+    st.warning("⚠️ 未找到中文字体，图表中文可能显示为英文或符号")
     return 'DejaVu Sans'
 
 
