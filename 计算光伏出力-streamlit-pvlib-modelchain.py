@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib
+import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime, timedelta
 import pvlib
 from pvlib.modelchain import ModelChain
@@ -22,47 +22,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-
-# 设置中文字体（兼容Streamlit Cloud）
-def setup_chinese_font():
-    """设置中文字体支持，兼容Windows本地和Streamlit Cloud"""
-    import matplotlib.font_manager as fm
-    
-    # 重置默认配置
-    matplotlib.rcParams.update(matplotlib.rcParamsDefault)
-    
-    # 方案1：尝试从项目目录加载字体文件（适用于Streamlit Cloud）
-    font_path = os.path.join(os.path.dirname(__file__), 'SimHei.ttf')
-    if os.path.exists(font_path):
-        try:
-            font_prop = fm.FontProperties(fname=font_path)
-            matplotlib.rcParams['font.family'] = font_prop.get_name()
-            matplotlib.rcParams['axes.unicode_minus'] = False
-            st.info("✅ 已加载项目目录中的中文字体 (SimHei.ttf)")
-            return font_prop.get_name()
-        except Exception:
-            pass
-    
-    # 方案2：尝试系统已安装的中文字体（适用于本地Windows）
-    available_fonts = [f.name for f in fm.fontManager.ttflist]
-    chinese_fonts = ['SimHei', 'Microsoft YaHei', 'Microsoft JhengHei', 'PingFang SC', 'WenQuanYi Micro Hei']
-    
-    for font_name in chinese_fonts:
-        if font_name in available_fonts:
-            matplotlib.rcParams['font.family'] = font_name
-            matplotlib.rcParams['axes.unicode_minus'] = False
-            return font_name
-    
-    # 方案3：使用DejaVu Sans（英文字体，不会出现乱码方块，但中文可能不显示）
-    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
-    matplotlib.rcParams['axes.unicode_minus'] = False
-    st.warning("⚠️ 未找到中文字体，图表中文可能显示为英文或符号")
-    return 'DejaVu Sans'
-
-
-# 初始化字体
-font_name = setup_chinese_font()
 
 # 从Excel文件加载组件参数
 MODULES_EXCEL_PATH = os.path.join(os.path.dirname(__file__), '组件参数库.xlsx')
@@ -1201,15 +1160,44 @@ with forecast_tab:
                         color = '#2196F3'
                         label = '预测直流功率'
                         
-                    fig, ax = plt.subplots(figsize=(14, 6))
-                    ax.plot(forecast_df.index, forecast_df[col_name], label=label, color=color, linewidth=2)
-                    ax.set_xlabel('时间', fontsize=12)
-                    ax.set_ylabel('功率 (kW)', fontsize=12)
-                    ax.set_title(f'{station_name} - 光伏发电功率预测', fontsize=14)
-                    ax.legend()
-                    ax.grid(True, linestyle='--', alpha=0.6)
-                    plt.xticks(rotation=45)
-                    st.pyplot(fig)
+                    # 格式化时间标签为中文
+                    def format_datetime_chinese(dt):
+                        """将datetime转换为中文日期格式"""
+                        months = ['1月', '2月', '3月', '4月', '5月', '6月', 
+                                 '7月', '8月', '9月', '10月', '11月', '12月']
+                        month_str = months[dt.month - 1]
+                        return f"{dt.month}月{dt.day}日 {dt.hour:02d}:00"
+                    
+                    # 生成中文时间标签（每隔6小时显示一个）
+                    n = len(forecast_df)
+                    step = max(1, n // 8)  # 最多显示8个标签
+                    tick_indices = list(range(0, n, step))
+                    
+                    tick_vals = [forecast_df.index[i] for i in tick_indices]
+                    tick_texts = [format_datetime_chinese(forecast_df.index[i]) for i in tick_indices]
+                    
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=forecast_df.index,
+                        y=forecast_df[col_name],
+                        mode='lines',
+                        name=label,
+                        line=dict(color=color, width=2)
+                    ))
+                    fig.update_layout(
+                        title=f'{station_name} - 光伏发电功率预测',
+                        xaxis_title='时间',
+                        yaxis_title='功率 (kW)',
+                        showlegend=True,
+                        template='plotly_white',
+                        xaxis=dict(
+                            tickmode='array',
+                            tickvals=tick_vals,
+                            ticktext=tick_texts,
+                            tickangle=45
+                        )
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     
                     # 预测数据统计
                     st.subheader("📊 预测数据概览")
@@ -1603,33 +1591,38 @@ with result_tab:
                 # 显示筛选后的数据范围
                 st.info(f"📊 显示数据范围：{start_date} 至 {end_date}，共 {len(filtered_df)} 小时")
                 
+                # 创建时间索引
+                hours_index = list(range(len(filtered_df)))
+                
                 # 绘制图表
-                fig, ax = plt.subplots(figsize=(14, 6))
-                
-                # 使用筛选后的数据
-                hours_index = range(len(filtered_df))
-                
-                # 绘制功率曲线
-                # ax.plot(hours_index, filtered_df['p_ac'] / 1000, 'b-', linewidth=0.8, alpha=0.7, label='交流功率')
-                ax.plot(hours_index, filtered_df['p_dc'] / 1000, 'r-', linewidth=0.8, alpha=0.7, label='直流功率')
-                
-                ax.set_xlabel('时间序列 (小时)')
-                ax.set_ylabel('功率 (kW)')
-                ax.set_title(f'发电功率曲线 ({start_date} 至 {end_date}, 共{len(filtered_df)}小时)')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=hours_index,
+                    y=filtered_df['p_dc'] / 1000,
+                    mode='lines',
+                    name='直流功率',
+                    line=dict(color='red', width=0.8)
+                ))
+                fig.update_layout(
+                    title=f'发电功率曲线 ({start_date} 至 {end_date}, 共{len(filtered_df)}小时)',
+                    xaxis_title='时间序列 (小时)',
+                    yaxis_title='功率 (kW)',
+                    showlegend=True,
+                    template='plotly_white',
+                    hovermode='x unified'
+                )
+                fig.update_xaxes(tickangle=45)
                 
                 # 设置X轴刻度，根据数据长度动态调整
                 num_hours = len(filtered_df)
                 if num_hours > 0:
-                    # 根据数据范围大小决定刻度间隔
-                    if num_hours <= 168:  # 一周以内，显示每天
+                    if num_hours <= 168:
                         tick_interval = 24
                         date_format = '%m-%d'
-                    elif num_hours <= 720:  # 一个月以内，显示每周
+                    elif num_hours <= 720:
                         tick_interval = 168
                         date_format = '%m-%d'
-                    else:  # 更长，显示每月
+                    else:
                         tick_interval = max(1, num_hours // 12)
                         date_format = '%Y-%m'
                     
@@ -1642,8 +1635,9 @@ with result_tab:
                         else:
                             tick_labels.append('')
                     
-                    ax.set_xticks(tick_positions)
-                    ax.set_xticklabels(tick_labels, rotation=45, ha='right')
+                    fig.update_xaxes(tickvals=tick_positions, ticktext=tick_labels)
+                
+                st.plotly_chart(fig, use_container_width=True)
 
         elif chart_type == "发电交流功率曲线":
             # 添加时间范围选择器
@@ -1689,33 +1683,38 @@ with result_tab:
                 # 显示筛选后的数据范围
                 st.info(f"📊 显示数据范围：{start_date} 至 {end_date}，共 {len(filtered_df)} 小时")
 
+                # 创建时间索引
+                hours_index = list(range(len(filtered_df)))
+
                 # 绘制图表
-                fig, ax = plt.subplots(figsize=(14, 6))
-
-                # 使用筛选后的数据
-                hours_index = range(len(filtered_df))
-
-                # 绘制功率曲线
-                ax.plot(hours_index, filtered_df['p_ac'] / 1000, 'b-', linewidth=0.8, alpha=0.7, label='交流功率')
-                # ax.plot(hours_index, filtered_df['p_dc'] / 1000, 'r--', linewidth=0.8, alpha=0.7, label='直流功率')
-
-                ax.set_xlabel('时间序列 (小时)')
-                ax.set_ylabel('功率 (kW)')
-                ax.set_title(f'发电功率曲线 ({start_date} 至 {end_date}, 共{len(filtered_df)}小时)')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=hours_index,
+                    y=filtered_df['p_ac'] / 1000,
+                    mode='lines',
+                    name='交流功率',
+                    line=dict(color='blue', width=0.8)
+                ))
+                fig.update_layout(
+                    title=f'发电功率曲线 ({start_date} 至 {end_date}, 共{len(filtered_df)}小时)',
+                    xaxis_title='时间序列 (小时)',
+                    yaxis_title='功率 (kW)',
+                    showlegend=True,
+                    template='plotly_white',
+                    hovermode='x unified'
+                )
+                fig.update_xaxes(tickangle=45)
 
                 # 设置X轴刻度，根据数据长度动态调整
                 num_hours = len(filtered_df)
                 if num_hours > 0:
-                    # 根据数据范围大小决定刻度间隔
-                    if num_hours <= 168:  # 一周以内，显示每天
+                    if num_hours <= 168:
                         tick_interval = 24
                         date_format = '%m-%d'
-                    elif num_hours <= 720:  # 一个月以内，显示每周
+                    elif num_hours <= 720:
                         tick_interval = 168
                         date_format = '%m-%d'
-                    else:  # 更长，显示每月
+                    else:
                         tick_interval = max(1, num_hours // 12)
                         date_format = '%Y-%m'
 
@@ -1728,101 +1727,233 @@ with result_tab:
                         else:
                             tick_labels.append('')
 
-                    ax.set_xticks(tick_positions)
-                    ax.set_xticklabels(tick_labels, rotation=45, ha='right')
+                    fig.update_xaxes(tickvals=tick_positions, ticktext=tick_labels)
+
+                st.plotly_chart(fig, use_container_width=True)
 
 
 
 
 
         elif chart_type == "月发电量趋势":
-            fig, ax = plt.subplots(figsize=(12, 6))
             monthly_energy = df['energy_ac_kwh'].resample('ME').sum()
-            months = [m.strftime('%Y-%m') for m in monthly_energy.index]
-
-            bars = ax.bar(range(len(months)), monthly_energy.values, alpha=0.7, color='green')
-            ax.set_xlabel('月份')
-            ax.set_ylabel('月发电量 (kWh)')
-            ax.set_title('月发电量趋势')
-            ax.grid(True, alpha=0.3, axis='y')
-
-            for i, v in enumerate(monthly_energy.values):
-                ax.text(i, v, f'{v:,.0f}', ha='center', va='bottom', fontsize=9)
-
-            if len(months) > 6:
-                tick_indices = range(0, len(months), max(1, len(months) // 6))
-                ax.set_xticks(tick_indices)
-                ax.set_xticklabels([months[i] for i in tick_indices], rotation=45)
-            else:
-                ax.set_xticks(range(len(months)))
-                ax.set_xticklabels(months, rotation=45)
+            
+            # 将月份格式化为中文
+            def format_month_chinese(dt):
+                return f"{dt.year}年{dt.month}月"
+            
+            months = [format_month_chinese(m) for m in monthly_energy.index]
+            
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=months,
+                    y=monthly_energy.values,
+                    name='月发电量',
+                    marker_color='green',
+                    text=[f'{v:,.0f}' for v in monthly_energy.values],
+                    textposition='auto'
+                )
+            ])
+            fig.update_layout(
+                title='月发电量趋势',
+                xaxis_title='月份',
+                yaxis_title='月发电量 (kWh)',
+                template='plotly_white',
+                xaxis_tickangle=45
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            chart_plotted = True
 
         elif chart_type == "辐射分析":
-            fig, ax = plt.subplots(figsize=(12, 6))
             daily_ghi = df['ghi'].resample('D').mean()
             daily_poa = df['poa_global'].resample('D').mean()
-
-            ax.plot(daily_ghi.index, daily_ghi.values, 'r-', alpha=0.7, label='水平面辐射 (GHI)')
-            ax.plot(daily_poa.index, daily_poa.values, 'b-', alpha=0.7, label='倾斜面辐射 (POA)')
-            ax.set_xlabel('日期')
-            ax.set_ylabel('辐射强度 (W/m²)')
-            ax.set_title('辐射分析')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+            
+            # 生成中文日期标签（每隔30天显示一个）
+            def format_date_chinese(dt):
+                return f"{dt.year}年{dt.month}月{dt.day}日"
+            
+            n = len(daily_ghi)
+            step = max(1, n // 8)  # 最多显示8个标签
+            tick_indices = list(range(0, n, step))
+            
+            tick_vals = [daily_ghi.index[i] for i in tick_indices]
+            tick_texts = [format_date_chinese(daily_ghi.index[i]) for i in tick_indices]
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=daily_ghi.index,
+                y=daily_ghi.values,
+                mode='lines',
+                name='水平面辐射 (GHI)',
+                line=dict(color='red', width=1)
+            ))
+            fig.add_trace(go.Scatter(
+                x=daily_poa.index,
+                y=daily_poa.values,
+                mode='lines',
+                name='倾斜面辐射 (POA)',
+                line=dict(color='blue', width=1)
+            ))
+            fig.update_layout(
+                title='辐射分析',
+                xaxis_title='日期',
+                yaxis_title='辐射强度 (W/m²)',
+                template='plotly_white',
+                xaxis=dict(
+                    tickmode='array',
+                    tickvals=tick_vals,
+                    ticktext=tick_texts,
+                    tickangle=45
+                )
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            chart_plotted = True
 
         elif chart_type == "温度分析":
-            fig, ax = plt.subplots(figsize=(12, 6))
             daily_temp_air = df['temp_air'].resample('D').mean()
             daily_temp_cell = df['temp_cell'].resample('D').mean()
-
-            ax.plot(daily_temp_air.index, daily_temp_air.values, 'g-', alpha=0.7, label='环境温度')
-            ax.plot(daily_temp_cell.index, daily_temp_cell.values, 'r-', alpha=0.7, label='电池温度')
-            ax.set_xlabel('日期')
-            ax.set_ylabel('温度 (°C)')
-            ax.set_title('温度分析')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+            
+            # 生成中文日期标签（每隔30天显示一个）
+            def format_date_chinese(dt):
+                return f"{dt.year}年{dt.month}月{dt.day}日"
+            
+            n = len(daily_temp_air)
+            step = max(1, n // 8)  # 最多显示8个标签
+            tick_indices = list(range(0, n, step))
+            
+            tick_vals = [daily_temp_air.index[i] for i in tick_indices]
+            tick_texts = [format_date_chinese(daily_temp_air.index[i]) for i in tick_indices]
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=daily_temp_air.index,
+                y=daily_temp_air.values,
+                mode='lines',
+                name='环境温度',
+                line=dict(color='green', width=1)
+            ))
+            fig.add_trace(go.Scatter(
+                x=daily_temp_cell.index,
+                y=daily_temp_cell.values,
+                mode='lines',
+                name='电池温度',
+                line=dict(color='red', width=1)
+            ))
+            fig.update_layout(
+                title='温度分析',
+                xaxis_title='日期',
+                yaxis_title='温度 (°C)',
+                template='plotly_white',
+                xaxis=dict(
+                    tickmode='array',
+                    tickvals=tick_vals,
+                    ticktext=tick_texts,
+                    tickangle=45
+                )
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            chart_plotted = True
 
         elif chart_type == "性能分析":
-            fig, ax = plt.subplots(figsize=(12, 6))
             daily_pr = (df['energy_ac_kwh'].resample('D').sum() /
                         ((df['poa_global'] / 1000 * config['system']['capacity_kw']).resample('D').sum()))
             daily_pr = daily_pr.replace([np.inf, -np.inf], np.nan).fillna(0)
-
-            ax.plot(daily_pr.index, daily_pr.values * 100, 'purple', alpha=0.7, linewidth=2)
-            ax.axhline(y=daily_pr.mean() * 100, color='r', linestyle='--', alpha=0.5,
-                       label=f'平均值: {daily_pr.mean() * 100:.1f}%')
-            ax.set_xlabel('日期')
-            ax.set_ylabel('性能比 (%)')
-            ax.set_title('日性能比趋势')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            ax.set_ylim(0, 100)
-
-        elif chart_type == "数据对比":
-            # 修复：这里使用子图而不是单个图表
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-
-            # 上子图：辐射
-            ax1.plot(df['poa_global'].resample('D').mean(), 'b-', alpha=0.7)
-            ax1.set_ylabel('辐射强度 (W/m²)', color='b')
-            ax1.tick_params(axis='y', labelcolor='b')
-            ax1.set_title('倾斜面辐射与发电量对比')
-            ax1.grid(True, alpha=0.3)
-
-            # 下子图：发电量
-            ax2 = ax1.twinx()
-            ax2.plot(df['energy_ac_kwh'].resample('D').sum(), 'r-', alpha=0.7)
-            ax2.set_ylabel('日发电量 (kWh)', color='r')
-            ax2.tick_params(axis='y', labelcolor='r')
-
-            # 直接显示这个图表
-            st.pyplot(fig)
+            
+            avg_pr = daily_pr.mean() * 100
+            
+            # 生成中文日期标签（每隔30天显示一个）
+            def format_date_chinese(dt):
+                return f"{dt.year}年{dt.month}月{dt.day}日"
+            
+            n = len(daily_pr)
+            step = max(1, n // 8)  # 最多显示8个标签
+            tick_indices = list(range(0, n, step))
+            
+            tick_vals = [daily_pr.index[i] for i in tick_indices]
+            tick_texts = [format_date_chinese(daily_pr.index[i]) for i in tick_indices]
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=daily_pr.index,
+                y=daily_pr.values * 100,
+                mode='lines',
+                name='日性能比',
+                line=dict(color='purple', width=2)
+            ))
+            fig.add_hline(
+                y=avg_pr,
+                line_dash="dash",
+                line_color="red",
+                annotation_text=f'平均值: {avg_pr:.1f}%'
+            )
+            fig.update_layout(
+                title='日性能比趋势',
+                xaxis_title='日期',
+                yaxis_title='性能比 (%)',
+                yaxis_range=[0, 100],
+                template='plotly_white',
+                xaxis=dict(
+                    tickmode='array',
+                    tickvals=tick_vals,
+                    ticktext=tick_texts,
+                    tickangle=45
+                )
+            )
+            st.plotly_chart(fig, use_container_width=True)
             chart_plotted = True
 
-        # 如果图表还没有显示，则显示它
-        if not chart_plotted and 'fig' in locals():
-            st.pyplot(fig)
+        elif chart_type == "数据对比":
+            daily_poa = df['poa_global'].resample('D').mean()
+            daily_energy = df['energy_ac_kwh'].resample('D').sum()
+            
+            # 生成中文日期标签（每隔30天显示一个）
+            def format_date_chinese(dt):
+                return f"{dt.year}年{dt.month}月{dt.day}日"
+            
+            n = len(daily_poa)
+            step = max(1, n // 8)  # 最多显示8个标签
+            tick_indices = list(range(0, n, step))
+            
+            tick_vals = [daily_poa.index[i] for i in tick_indices]
+            tick_texts = [format_date_chinese(daily_poa.index[i]) for i in tick_indices]
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=daily_poa.index,
+                y=daily_poa.values,
+                mode='lines',
+                name='倾斜面辐射 (W/m²)',
+                line=dict(color='blue', width=1),
+                yaxis='y'
+            ))
+            fig.add_trace(go.Scatter(
+                x=daily_energy.index,
+                y=daily_energy.values,
+                mode='lines',
+                name='日发电量 (kWh)',
+                line=dict(color='red', width=1),
+                yaxis='y2'
+            ))
+            fig.update_layout(
+                title='倾斜面辐射与发电量对比',
+                xaxis_title='日期',
+                yaxis_title='辐射强度 (W/m²)',
+                yaxis2=dict(
+                    title='日发电量 (kWh)',
+                    overlaying='y',
+                    side='right'
+                ),
+                template='plotly_white',
+                showlegend=True,
+                xaxis=dict(
+                    tickmode='array',
+                    tickvals=tick_vals,
+                    ticktext=tick_texts,
+                    tickangle=45
+                )
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            chart_plotted = True
 
         # 详细数据表格
         st.subheader("📋 详细数据预览")
