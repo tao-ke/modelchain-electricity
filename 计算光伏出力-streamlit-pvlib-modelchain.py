@@ -206,25 +206,37 @@ with st.sidebar:
     # 根据站点选择决定输入框是否可编辑
     is_custom = station_selector == "自定义"
     
+    # 当选择自定义时，显示站点名称输入框
+    custom_station_name = None
+    if is_custom:
+        custom_station_name = st.text_input(
+            " 站点名称",
+            placeholder="请输入站点名称（如：新站点）",
+            help="输入站点名称后可点击保存按钮加入站点参数库"
+        )
+    
+    # 当选择站点时，允许编辑以修改站点参数
+    allow_edit = not is_custom
+    
     latitude = st.number_input(
         "纬度 (°N)", 
         value=st.session_state.get('station_latitude', 23.4) if not is_custom else 23.4, 
         min_value=-90.0, 
         max_value=90.0,
-        disabled=not is_custom
+        disabled=False  # 允许编辑
     )
     longitude = st.number_input(
         "经度 (°E)", 
         value=st.session_state.get('station_longitude', 113.2) if not is_custom else 113.2, 
         min_value=-180.0, 
         max_value=180.0,
-        disabled=not is_custom
+        disabled=False  # 允许编辑
     )
     altitude = st.number_input(
         "海拔 (m)", 
         value=st.session_state.get('station_altitude', 91.46) if not is_custom else 91.46, 
         min_value=0.0,
-        disabled=not is_custom
+        disabled=False  # 允许编辑
     )
 
     st.subheader("🔧 光伏系统参数")
@@ -232,7 +244,7 @@ with st.sidebar:
         "系统容量 (kW)", 
         value=st.session_state.get('station_capacity', 10.0) if not is_custom else 10.0, 
         min_value=0.1,
-        disabled=not is_custom
+        disabled=False  # 允许编辑
     )
     tilt_angle = st.number_input("倾角 (°)", value=30, min_value=0, max_value=90)
     azimuth = st.number_input("方位角 (°)", value=180, min_value=0, max_value=360)
@@ -272,37 +284,48 @@ with st.sidebar:
     if module_selector in LONGI_MODULES:
         st.info(f"💡 组件效率: {LONGI_MODULES[module_selector]['efficiency']}%")
     
-    # 组件技术参数输入（从session_state读取，允许手动修改）
+    # 组件技术参数输入（选定组件型号后锁定参数）
+    is_module_locked = module_selector in LONGI_MODULES
+    
     module_power = st.number_input(
         "组件额定功率 (W)", 
         min_value=100.0, 
         step=10.0,
-        key='module_power'
+        key='module_power',
+        disabled=is_module_locked
     )
     voc = st.number_input(
         "开路电压 Voc (V)", 
         min_value=10.0, 
         step=0.1,
-        key='module_voc'
+        key='module_voc',
+        disabled=is_module_locked
     )
     isc = st.number_input(
         "短路电流 Isc (A)", 
         min_value=1.0, 
         step=0.1,
-        key='module_isc'
+        key='module_isc',
+        disabled=is_module_locked
     )
     vmp = st.number_input(
         "最大功率点电压 Vmp (V)", 
         min_value=10.0, 
         step=0.1,
-        key='module_vmp'
+        key='module_vmp',
+        disabled=is_module_locked
     )
     imp = st.number_input(
         "最大功率点电流 Imp (A)", 
         min_value=1.0, 
         step=0.01,
-        key='module_imp'
+        key='module_imp',
+        disabled=is_module_locked
     )
+    
+    # 提示用户如何修改参数
+    if is_module_locked:
+        st.caption("🔒 组件参数已锁定，如需修改请更改组件型号或在\"🔆 组件参数管理\"中编辑参数库")
 
     # 逆变器选择
     st.subheader("🔌 逆变器参数")
@@ -321,8 +344,107 @@ with st.sidebar:
         min_value=0.0, 
         max_value=1.0, 
         step=0.05,
-        disabled=not is_custom
+        disabled=False  # 允许编辑
     )
+    
+    # 添加保存按钮
+    if is_custom:
+        # 自定义模式：添加新站点
+        if st.button("➕ 添加到站点参数库", type="primary", help="将当前配置的站点加入站点参数库"):
+            if not custom_station_name or custom_station_name.strip() == "":
+                st.error("❌ 请先输入站点名称")
+            else:
+                try:
+                    # 读取当前站点参数库
+                    if os.path.exists(STATIONS_EXCEL_PATH):
+                        df_stations = pd.read_excel(STATIONS_EXCEL_PATH, engine='openpyxl')
+                    else:
+                        df_stations = pd.DataFrame()
+                    
+                    # 检查站点名称是否已存在
+                    if custom_station_name in df_stations['站点名称'].values:
+                        st.error(f"❌ 站点'{custom_station_name}'已存在，请使用其他名称")
+                    else:
+                        # 添加新站点
+                        new_row = pd.DataFrame([{
+                            '站点名称': custom_station_name,
+                            '经度': longitude,
+                            '纬度': latitude,
+                            '海拔': altitude,
+                            '容量': system_capacity,
+                            '光伏组件': module_selector,
+                            '不确定系数': uncertainty_factor
+                        }])
+                        df_stations = pd.concat([df_stations, new_row], ignore_index=True)
+                        
+                        # 保存回Excel
+                        df_stations.to_excel(STATIONS_EXCEL_PATH, index=False, engine='openpyxl')
+                        
+                        # 更新STATIONS字典
+                        STATIONS[custom_station_name] = {
+                            'longitude': longitude,
+                            'latitude': latitude,
+                            'altitude': altitude,
+                            'capacity': system_capacity,
+                            'module': module_selector,
+                            'uncertainty_factor': uncertainty_factor
+                        }
+                        
+                        st.success(f"✅ 站点'{custom_station_name}'已添加到站点参数库！")
+                        st.info("💡 正在刷新页面以加载新站点...")
+                        st.rerun()
+                        
+                except Exception as e:
+                    st.error(f"❌ 添加失败: {str(e)}")
+    elif station_selector in STATIONS:
+        # 预设站点模式：保存修改
+        if st.button("💾 保存站点修改", type="secondary", help="将当前修改保存到站点参数库"):
+            try:
+                # 读取当前站点参数库
+                if os.path.exists(STATIONS_EXCEL_PATH):
+                    df_stations = pd.read_excel(STATIONS_EXCEL_PATH, engine='openpyxl')
+                else:
+                    df_stations = pd.DataFrame()
+                
+                # 查找要更新的站点
+                station_idx = df_stations[df_stations['站点名称'] == station_selector].index
+                
+                if len(station_idx) > 0:
+                    # 更新现有站点
+                    idx = station_idx[0]
+                    df_stations.at[idx, '经度'] = longitude
+                    df_stations.at[idx, '纬度'] = latitude
+                    df_stations.at[idx, '海拔'] = altitude
+                    df_stations.at[idx, '容量'] = system_capacity
+                    df_stations.at[idx, '光伏组件'] = module_selector
+                    df_stations.at[idx, '不确定系数'] = uncertainty_factor
+                    
+                    # 保存回Excel
+                    df_stations.to_excel(STATIONS_EXCEL_PATH, index=False, engine='openpyxl')
+                    
+                    # 更新STATIONS字典
+                    STATIONS[station_selector] = {
+                        'longitude': longitude,
+                        'latitude': latitude,
+                        'altitude': altitude,
+                        'capacity': system_capacity,
+                        'module': module_selector,
+                        'uncertainty_factor': uncertainty_factor
+                    }
+                    
+                    # 更新session_state
+                    st.session_state['station_longitude'] = longitude
+                    st.session_state['station_latitude'] = latitude
+                    st.session_state['station_altitude'] = altitude
+                    st.session_state['station_capacity'] = system_capacity
+                    st.session_state['station_uncertainty_factor'] = uncertainty_factor
+                    
+                    st.success(f"✅ 站点'{station_selector}'修改已保存！")
+                else:
+                    st.error(f"❌ 未找到站点'{station_selector}'")
+                    
+            except Exception as e:
+                st.error(f"❌ 保存失败: {str(e)}")
 
     # 保存参数到session state
     st.session_state['config'] = {
@@ -355,96 +477,248 @@ with st.sidebar:
 weather_tab, module_tab, calc_tab, result_tab, export_tab, forecast_tab = st.tabs(["🌤️ 气象数据上传", "🔆 组件参数管理", "🚀 ModelChain计算", "📊 结果分析", "📤 导出报告", "🔮 光伏出力预测"])
 
 with weather_tab:
-    st.header("🌤️ 气象数据上传")
-    st.subheader("📁 NASA POWER气象数据上传")
-
-    uploaded_file = st.file_uploader("选择NASA POWER CSV数据文件", type=['csv'], key='weather_data_upload')
-
-    if uploaded_file is not None:
-        try:
-            # 读取文件
-            content = uploaded_file.read().decode('utf-8')
-            lines = content.split('\n')
-
-            # 查找数据开始行
-            data_start_line = 0
-            for i, line in enumerate(lines):
-                if 'YEAR' in line and 'MO' in line and 'DY' in line and 'HR' in line:
-                    data_start_line = i
-                    break
-
-            # 重新读取文件
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, skiprows=data_start_line, low_memory=False)
-            df.columns = df.columns.str.strip()
-
-            # 创建日期时间索引
-            if all(col in df.columns for col in ['YEAR', 'MO', 'DY', 'HR']):
-                df['datetime'] = pd.to_datetime({
-                    'year': df['YEAR'],
-                    'month': df['MO'],
-                    'day': df['DY'],
-                    'hour': df['HR']
-                })
-                df.set_index('datetime', inplace=True)
-
-                df.index = df.index.tz_localize('Asia/Shanghai')
-
-                # 处理缺失值
-                for col in df.columns:
-                    if df[col].dtype in [np.float64, np.int64]:
-                        df[col] = df[col].replace(-999.0, np.nan)
-
-                # 列名映射
-                column_mapping = {
-                    'ALLSKY_SFC_SW_DNI': 'dni',
-                    'ALLSKY_SFC_SW_DWN': 'ghi',
-                    'ALLSKY_SFC_SW_DIFF': 'dhi',
-                    'T2M': 'temp_air',
-                    'WS10M': 'wind_speed',
-                }
-
-                # 应用列名映射
-                for old_col, new_col in column_mapping.items():
-                    if old_col in df.columns:
-                        df[new_col] = df[old_col]
-
-                # 确保必要列存在
-                required_cols = ['ghi', 'dni', 'dhi', 'temp_air']
-                for col in required_cols:
-                    if col not in df.columns:
-                        df[col] = 0.0
-
-                if 'wind_speed' not in df.columns:
-                    df['wind_speed'] = 1.0
-
-                st.session_state['data'] = df
-                st.session_state['data_loaded'] = True
-
-                st.success(f"✅ 数据加载成功！共 {len(df)} 行数据")
-
-                # 显示数据预览
-                with st.expander("📊 数据预览"):
-                    st.dataframe(df.head())
-
-                # 显示数据统计
-                st.subheader("📈 数据统计信息")
-                col1, col2, col3, col4 = st.columns(4)
-
-                with col1:
-                    st.metric("GHI平均值", f"{df['ghi'].mean():.1f} W/m²")
-                with col2:
-                    st.metric("DNI平均值", f"{df['dni'].mean():.1f} W/m²")
-                with col3:
-                    st.metric("温度平均值", f"{df['temp_air'].mean():.1f} °C")
-                with col4:
-                    st.metric("数据时间范围", f"{len(df)} 小时")
-
+    st.header("🌤️ 气象数据获取")
+    
+    # 创建两个子选项卡：下载 和 上传
+    download_tab, upload_tab = st.tabs(["🌐 从NASA POWER下载", "📁 上传本地文件"])
+    
+    # ========== 子选项卡1: 从NASA POWER下载 ==========
+    with download_tab:
+        st.subheader("🌐 从NASA POWER API下载气象数据")
+        st.markdown("""
+        根据当前选择的**站点经纬度**和**时间范围**，直接从NASA POWER API下载气象数据。
+        
+        > 📌 NASA POWER提供全球太阳能和气象数据，涵盖1981年至今。
+        """)
+        
+        # 检查是否有站点信息
+        if 'station_longitude' not in st.session_state or 'station_latitude' not in st.session_state:
+            st.warning("⚠️ 请先在侧边栏选择一个站点或设置经纬度")
+        else:
+            # 显示当前经纬度
+            lat = st.session_state.get('station_latitude', 23.4)
+            lon = st.session_state.get('station_longitude', 113.2)
+            st.info(f"📍 当前经纬度: 纬度 {lat}°N, 经度 {lon}°E")
+            
+            # 时间范围选择
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input(
+                    "开始日期",
+                    value=datetime.now() - timedelta(days=30),
+                    min_value=datetime(1981, 1, 1),
+                    max_value=datetime.now() - timedelta(days=2)
+                )
+            with col2:
+                end_date = st.date_input(
+                    "结束日期",
+                    value=datetime.now() - timedelta(days=1),
+                    min_value=datetime(1981, 1, 1),
+                    max_value=datetime.now() - timedelta(days=1)
+                )
+            
+            # 检查日期有效性
+            if start_date > end_date:
+                st.error("❌ 开始日期不能晚于结束日期")
             else:
-                st.error("❌ 数据文件缺少必要的列")
+                download_btn = st.button("📥 下载气象数据", type="primary")
+                
+                if download_btn:
+                    try:
+                        import requests
+                        
+                        with st.spinner("正在从NASA POWER下载数据，请稍候..."):
+                            # 构建NASA POWER API URL
+                            url = (
+                                f"https://power.larc.nasa.gov/api/temporal/hourly/point"
+                                f"?start={start_date.strftime('%Y%m%d')}&end={end_date.strftime('%Y%m%d')}"
+                                f"&latitude={lat}&longitude={lon}"
+                                f"&community=RE"
+                                f"&parameters=ALLSKY_SFC_SW_DNI,ALLSKY_SFC_SW_DWN,ALLSKY_SFC_SW_DIFF,T2M,WS10M"
+                                f"&format=CSV"
+                            )
+                            
+                            response = requests.get(url, timeout=120)
+                            response.raise_for_status()
+                            
+                            # 解析CSV内容
+                            content = response.text
+                            lines = content.split('\n')
+                            
+                            # 查找数据开始行
+                            data_start_line = 0
+                            for i, line in enumerate(lines):
+                                if 'YEAR' in line and 'MO' in line and 'DY' in line and 'HR' in line:
+                                    data_start_line = i
+                                    break
+                            
+                            # 读取数据
+                            df = pd.read_csv(io.StringIO('\n'.join(lines[data_start_line:])), low_memory=False)
+                            df.columns = df.columns.str.strip()
+                            
+                            # 创建日期时间索引
+                            if all(col in df.columns for col in ['YEAR', 'MO', 'DY', 'HR']):
+                                df['datetime'] = pd.to_datetime({
+                                    'year': df['YEAR'],
+                                    'month': df['MO'],
+                                    'day': df['DY'],
+                                    'hour': df['HR']
+                                })
+                                df.set_index('datetime', inplace=True)
+                                df.index = df.index.tz_localize('Asia/Shanghai')
+                                
+                                # 处理缺失值
+                                for col in df.columns:
+                                    if df[col].dtype in [np.float64, np.int64]:
+                                        df[col] = df[col].replace(-999.0, np.nan)
+                                
+                                # 列名映射
+                                column_mapping = {
+                                    'ALLSKY_SFC_SW_DNI': 'dni',
+                                    'ALLSKY_SFC_SW_DWN': 'ghi',
+                                    'ALLSKY_SFC_SW_DIFF': 'dhi',
+                                    'T2M': 'temp_air',
+                                    'WS10M': 'wind_speed',
+                                }
+                                
+                                for old_col, new_col in column_mapping.items():
+                                    if old_col in df.columns:
+                                        df[new_col] = df[old_col]
+                                
+                                # 确保必要列存在
+                                required_cols = ['ghi', 'dni', 'dhi', 'temp_air']
+                                for col in required_cols:
+                                    if col not in df.columns:
+                                        df[col] = 0.0
+                                
+                                if 'wind_speed' not in df.columns:
+                                    df['wind_speed'] = 1.0
+                                
+                                # 保存结果
+                                st.session_state['data'] = df
+                                st.session_state['data_loaded'] = True
+                                
+                                st.success(f"✅ 下载成功！获取 {len(df)} 行数据 ({start_date} ~ {end_date})")
+                                
+                                # 显示数据预览
+                                with st.expander("📊 数据预览"):
+                                    st.dataframe(df.head())
+                                
+                                # 显示数据统计
+                                st.subheader("📈 数据统计信息")
+                                col_a, col_b, col_c, col_d = st.columns(4)
+                                with col_a:
+                                    st.metric("GHI平均值", f"{df['ghi'].mean():.1f} W/m²")
+                                with col_b:
+                                    st.metric("DNI平均值", f"{df['dni'].mean():.1f} W/m²")
+                                with col_c:
+                                    st.metric("温度平均值", f"{df['temp_air'].mean():.1f} °C")
+                                with col_d:
+                                    st.metric("数据时间范围", f"{len(df)} 小时")
+                            else:
+                                st.error("❌ 下载的数据格式不正确")
+                                
+                    except requests.exceptions.Timeout:
+                        st.error("❌ 请求超时，NASA POWER API响应较慢，请稍后重试")
+                    except requests.exceptions.RequestException as e:
+                        st.error(f"❌ 下载失败: {str(e)}")
+                    except Exception as e:
+                        st.error(f"❌ 解析数据时出错: {str(e)}")
+                        with st.expander("🔍 查看详细错误"):
+                            st.exception(e)
+    
+    # ========== 子选项卡2: 上传本地文件 ==========
+    with upload_tab:
+        st.subheader("📁 上传本地气象数据文件")
+        st.markdown("上传NASA POWER下载的CSV格式气象数据文件")
 
-        except Exception as e:
-            st.error(f"❌ 读取文件时出错: {str(e)}")
+        uploaded_file = st.file_uploader("选择NASA POWER CSV数据文件", type=['csv'], key='weather_data_upload')
+
+        if uploaded_file is not None:
+            try:
+                # 读取文件
+                content = uploaded_file.read().decode('utf-8')
+                lines = content.split('\n')
+
+                # 查找数据开始行
+                data_start_line = 0
+                for i, line in enumerate(lines):
+                    if 'YEAR' in line and 'MO' in line and 'DY' in line and 'HR' in line:
+                        data_start_line = i
+                        break
+
+                # 重新读取文件
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, skiprows=data_start_line, low_memory=False)
+                df.columns = df.columns.str.strip()
+
+                # 创建日期时间索引
+                if all(col in df.columns for col in ['YEAR', 'MO', 'DY', 'HR']):
+                    df['datetime'] = pd.to_datetime({
+                        'year': df['YEAR'],
+                        'month': df['MO'],
+                        'day': df['DY'],
+                        'hour': df['HR']
+                    })
+                    df.set_index('datetime', inplace=True)
+
+                    df.index = df.index.tz_localize('Asia/Shanghai')
+
+                    # 处理缺失值
+                    for col in df.columns:
+                        if df[col].dtype in [np.float64, np.int64]:
+                            df[col] = df[col].replace(-999.0, np.nan)
+
+                    # 列名映射
+                    column_mapping = {
+                        'ALLSKY_SFC_SW_DNI': 'dni',
+                        'ALLSKY_SFC_SW_DWN': 'ghi',
+                        'ALLSKY_SFC_SW_DIFF': 'dhi',
+                        'T2M': 'temp_air',
+                        'WS10M': 'wind_speed',
+                    }
+
+                    # 应用列名映射
+                    for old_col, new_col in column_mapping.items():
+                        if old_col in df.columns:
+                            df[new_col] = df[old_col]
+
+                    # 确保必要列存在
+                    required_cols = ['ghi', 'dni', 'dhi', 'temp_air']
+                    for col in required_cols:
+                        if col not in df.columns:
+                            df[col] = 0.0
+
+                    if 'wind_speed' not in df.columns:
+                        df['wind_speed'] = 1.0
+
+                    st.session_state['data'] = df
+                    st.session_state['data_loaded'] = True
+
+                    st.success(f"✅ 数据加载成功！共 {len(df)} 行数据")
+
+                    # 显示数据预览
+                    with st.expander("📊 数据预览"):
+                        st.dataframe(df.head())
+
+                    # 显示数据统计
+                    st.subheader("📈 数据统计信息")
+                    col1, col2, col3, col4 = st.columns(4)
+
+                    with col1:
+                        st.metric("GHI平均值", f"{df['ghi'].mean():.1f} W/m²")
+                    with col2:
+                        st.metric("DNI平均值", f"{df['dni'].mean():.1f} W/m²")
+                    with col3:
+                        st.metric("温度平均值", f"{df['temp_air'].mean():.1f} °C")
+                    with col4:
+                        st.metric("数据时间范围", f"{len(df)} 小时")
+
+                else:
+                    st.error("❌ 数据文件缺少必要的列")
+
+            except Exception as e:
+                st.error(f"❌ 读取文件时出错: {str(e)}")
 
 with module_tab:
     st.header("🔆 组件参数管理")
@@ -520,39 +794,47 @@ with module_tab:
         except Exception as e:
             st.error(f"❌ 读取Excel文件失败: {str(e)}")
     
-    # 下载模板
+    # 下载组件参数库
     st.markdown("---")
-    st.markdown("#### 📋 下载模板文件")
+    st.markdown("#### 💾 导出组件参数库")
     
-    if st.button("📥 下载组件参数模板", key='download_template_btn'):
-        # 创建模板DataFrame
-        template_data = {
-            '组件型号': ['示例组件-550W (550W)'],
-            'pdc0': [550.0],
-            'Voc': [49.80],
-            'Isc': [13.98],
-            'Vmp': [41.95],
-            'Imp': [13.12],
-            'efficiency': [21.3]
-        }
-        template_df = pd.DataFrame(template_data)
+    if not LONGI_MODULES:
+        st.info("💡 当前组件库为空，请先上传组件参数文件")
+    else:
+        st.info(f"📊 当前组件库包含 **{len(LONGI_MODULES)}** 个组件型号")
         
-        # 转换为Excel字节流
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            template_df.to_excel(writer, index=False, sheet_name='组件参数')
-        output.seek(0)
-        
-        # 提供下载
-        st.download_button(
-            label="⬇️ 下载模板.xlsx",
-            data=output,
-            file_name="组件参数模板.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key='download_template'
-        )
-        
-        st.info("💡 下载模板后，按照格式填写您的组件参数，然后上传即可")
+        if st.button("📥 下载组件参数库", key='download_module_library_btn'):
+            # 将组件字典转换为DataFrame
+            library_data = []
+            for name, params in LONGI_MODULES.items():
+                library_data.append({
+                    '组件型号': name,
+                    'pdc0': params.get('pdc0', 0),
+                    'Voc': params.get('Voc', 0),
+                    'Isc': params.get('Isc', 0),
+                    'Vmp': params.get('Vmp', 0),
+                    'Imp': params.get('Imp', 0),
+                    'efficiency': params.get('efficiency', 0)
+                })
+            
+            library_df = pd.DataFrame(library_data)
+            
+            # 转换为Excel字节流
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                library_df.to_excel(writer, index=False, sheet_name='组件参数库')
+            output.seek(0)
+            
+            # 提供下载
+            st.download_button(
+                label="⬇️ 下载组件参数库.xlsx",
+                data=output,
+                file_name=f"组件参数库_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key='download_module_library'
+            )
+            
+            st.success("✅ 组件参数库导出成功！")
     
     # ========== 站点参数管理 ==========
     st.markdown("---")
@@ -636,38 +918,47 @@ with module_tab:
         except Exception as e:
             st.error(f"❌ 读取Excel文件失败: {str(e)}")
     
-    # 下载站点模板
-    st.markdown("#### 📋 下载站点参数模板")
+    # 下载站点参数库
+    st.markdown("---")
+    st.markdown("#### 💾 导出站点参数库")
     
-    if st.button("📥 下载站点参数模板", key='download_station_template_btn'):
-        # 创建模板DataFrame
-        template_data = {
-            '站点名称': ['示例站点'],
-            '经度': [113.2],
-            '纬度': [23.4],
-            '海拔': [91.46],
-            '容量': [10.0],
-            '光伏组件': ['LONGi LR5-72HPH-550M (550W)'],
-            '不确定系数': [0.8]
-        }
-        template_df = pd.DataFrame(template_data)
+    if not STATIONS:
+        st.info("💡 当前站点库为空，请先上传站点参数文件")
+    else:
+        st.info(f"📊 当前站点库包含 **{len(STATIONS)}** 个站点")
         
-        # 转换为Excel字节流
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            template_df.to_excel(writer, index=False, sheet_name='站点参数')
-        output.seek(0)
-        
-        # 提供下载
-        st.download_button(
-            label="⬇️ 下载站点模板.xlsx",
-            data=output,
-            file_name="站点参数模板.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key='download_station_template'
-        )
-        
-        st.info("💡 下载模板后，按照格式填写您的站点参数，然后上传即可")
+        if st.button("📥 下载站点参数库", key='download_station_library_btn'):
+            # 将站点字典转换为DataFrame
+            library_data = []
+            for name, params in STATIONS.items():
+                library_data.append({
+                    '站点名称': name,
+                    '经度': params.get('longitude', 0),
+                    '纬度': params.get('latitude', 0),
+                    '海拔': params.get('altitude', 0),
+                    '容量': params.get('capacity', 0),
+                    '光伏组件': params.get('module', ''),
+                    '不确定系数': params.get('uncertainty_factor', 0.8)
+                })
+            
+            library_df = pd.DataFrame(library_data)
+            
+            # 转换为Excel字节流
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                library_df.to_excel(writer, index=False, sheet_name='站点参数库')
+            output.seek(0)
+            
+            # 提供下载
+            st.download_button(
+                label="⬇️ 下载站点参数库.xlsx",
+                data=output,
+                file_name=f"站点参数库_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key='download_station_library'
+            )
+            
+            st.success("✅ 站点参数库导出成功！")
 
 with forecast_tab:
     st.header("🔮 光伏出力预测 (基于天气预报)")
