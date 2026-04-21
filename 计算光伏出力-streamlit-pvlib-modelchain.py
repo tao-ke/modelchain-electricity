@@ -1360,7 +1360,8 @@ with calc_tab:
                     }, index=df.index)
 
                     # 处理缺失值
-                    weather_data = weather_data.fillna(method='ffill').fillna(0)
+                    # 新写法（兼容新版 pandas）
+                    weather_data = weather_data.ffill().fillna(0)
 
                     # 运行ModelChain
                     mc.run_model(weather_data)
