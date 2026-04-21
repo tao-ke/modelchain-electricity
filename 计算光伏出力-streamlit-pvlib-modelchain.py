@@ -23,13 +23,48 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 设置中文字体
+
+
+'''
 def setup_chinese_font():
     """设置中文字体支持"""
     matplotlib.rcParams.update(matplotlib.rcParamsDefault)
     matplotlib.rcParams['font.family'] = ['DejaVu Sans', 'Microsoft YaHei', 'SimHei', 'sans-serif']
     matplotlib.rcParams['axes.unicode_minus'] = False
     return 'DejaVu Sans'
+'''
+
+
+# 设置中文字体（兼容 Windows 和 Linux）
+def setup_chinese_font():
+    """设置中文字体支持"""
+    import matplotlib.font_manager as fm
+
+    # 尝试使用 Linux 系统自带的中文字体
+    linux_fonts = ['WenQuanYi Micro Hei', 'Droid Sans Fallback', 'AR PL UMing CN']
+    # Windows 常用字体
+    windows_fonts = ['Microsoft YaHei', 'SimHei', 'KaiTi']
+
+    # 获取系统可用字体列表
+    available_fonts = [f.name for f in fm.fontManager.ttflist]
+
+    # 优先选择可用字体
+    selected_font = None
+    for font in linux_fonts + windows_fonts:
+        if font in available_fonts:
+            selected_font = font
+            break
+
+    # 如果都没有，使用默认 sans-serif
+    if selected_font is None:
+        selected_font = 'DejaVu Sans'
+        st.warning("⚠️ 未找到中文字体，图表中文可能显示为方框。建议在 requirements.txt 中添加 fonttools 库")
+
+    matplotlib.rcParams['font.family'] = ['sans-serif']
+    matplotlib.rcParams['font.sans-serif'] = [selected_font]
+    matplotlib.rcParams['axes.unicode_minus'] = False
+
+    return selected_font
 
 
 # 初始化字体
