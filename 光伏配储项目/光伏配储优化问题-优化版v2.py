@@ -203,6 +203,14 @@ for i in range(num):
         prob += y_ch[i] <= z_ch[i]
         prob += y_ch[i] <= 1 - z_ch[i-1]
 
+    # 启动定义（放电）
+    if i == 0:
+        prob += y_dis[i] == z_dis[i]
+    else:
+        prob += y_dis[i] >= z_dis[i] - z_dis[i-1]
+        prob += y_dis[i] <= z_dis[i]
+        prob += y_dis[i] <= 1 - z_dis[i-1]
+
 # 最小连续时长 + 尾部禁止启动（充电）
 for i in range(num):
     if i <= num - min_duration:
@@ -210,6 +218,12 @@ for i in range(num):
     else:
         prob += y_ch[i] == 0
 
+# 最小连续时长 + 尾部禁止启动（放电）
+for i in range(num):
+    if i <= num - min_duration:
+        prob += pulp.lpSum(z_dis[j] for j in range(i, i + min_duration)) >= min_duration * y_dis[i]
+    else:
+        prob += y_dis[i] == 0
 
 # 最终电量约束：最终电量等于初始电量
 prob += soc[num] == initial_soc
