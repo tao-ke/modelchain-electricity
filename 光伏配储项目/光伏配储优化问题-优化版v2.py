@@ -156,6 +156,16 @@ charge_power = pulp.LpVariable.dicts("charge", range(num), lowBound=0)  # 充电
 discharge_power = pulp.LpVariable.dicts("discharge", range(num), lowBound=0)  # 放电功率（向电网放出）
 soc = pulp.LpVariable.dicts("soc", range(num + 1), lowBound=0, upBound=battery_capacity)  # 电池电量
 
+# 二进制变量
+z_ch = pulp.LpVariable.dicts("is_charging", range(num), cat="Binary")
+z_dis = pulp.LpVariable.dicts("is_discharging", range(num), cat="Binary")
+y_ch = pulp.LpVariable.dicts("charge_start", range(num), cat="Binary")
+y_dis = pulp.LpVariable.dicts("discharge_start", range(num), cat="Binary")
+
+epsilon = 1e-3
+min_duration = 4
+min_on_power = 0.05 * P
+
 # 目标函数：最大化收益
 # 收益 = 放电收入 - 充电成本
 prob += pulp.lpSum([(discharge_power[i] - charge_power[i]) * price[i] * dt for i in range(num)])
@@ -170,11 +180,36 @@ for i in range(num):
     prob += soc[i + 1] == soc[i] + charge_power[i] * dt - discharge_power[i] * dt / efficiency
 
 # 功率约束（仅考虑逆变器功率限制）
-print("\n添加功率约束...")
-for i in range(num):
+#print("\n添加功率约束...")
+#for i in range(num):
     # 充放电功率不超过逆变器额定功率
-    prob += charge_power[i] <= P
-    prob += discharge_power[i] <= P
+#    prob += charge_power[i] <= P
+#    prob += discharge_power[i] <= P
+for i in range(num):
+    # 功率-状态关联
+    prob += charge_power[i] <= P * z_ch[i]
+    prob += discharge_power[i] <= P * z_dis[i]
+    prob += charge_power[i] >= min_on_power * z_ch[i]
+    prob += discharge_power[i] >= min_on_power * z_dis[i]
+
+    # 互斥：同一时段不能既充又放
+    prob += z_ch[i] + z_dis[i] <= 1
+
+    # 启动定义（充电）
+    if i == 0:
+        prob += y_ch[i] == z_ch[i]
+    else:
+        prob += y_ch[i] >= z_ch[i] - z_ch[i-1]
+        prob += y_ch[i] <= z_ch[i]
+        prob += y_ch[i] <= 1 - z_ch[i-1]
+
+# 最小连续时长 + 尾部禁止启动（充电）
+for i in range(num):
+    if i <= num - min_duration:
+        prob += pulp.lpSum(z_ch[j] for j in range(i, i + min_duration)) >= min_duration * y_ch[i]
+    else:
+        prob += y_ch[i] == 0
+
 
 # 最终电量约束：最终电量等于初始电量
 prob += soc[num] == initial_soc
@@ -327,8 +362,8 @@ if pulp.LpStatus[prob.status] == "Optimal":
         system_efficiency = total_discharge / total_charge * 100
         print(f"系统整体效率: {system_efficiency:.1f}% (目标: {efficiency * 100:.0f}%)")
 
-    charge_hours = sum(1 for i in range(num) if charge_power_values[i] > 0.001)
-    discharge_hours = sum(1 for i in range(num) if discharge_power_values[i] > 0.001)
+    charge_hours = sum(1 for i in range(num) if charge_power_values[i] > 1e-4)
+    discharge_hours = sum(1 for i in range(num) if discharge_power_values[i] > 1e-4)
     print(f"充电时段数: {charge_hours} (共{num}个时段)")
     print(f"放电时段数: {discharge_hours} (共{num}个时段)")
 
@@ -346,7 +381,7 @@ if pulp.LpStatus[prob.status] == "Optimal":
     current_segment_start = None
 
     for i in range(num):
-        if charge_power_values[i] > 0.001:  # 正在充电
+        if charge_power_values[i] > 1e-4:  # 正在充电
             if current_segment_start is None:
                 current_segment_start = i
             current_segment.append(i)
@@ -377,7 +412,7 @@ if pulp.LpStatus[prob.status] == "Optimal":
     current_segment_start = None
 
     for i in range(num):
-        if discharge_power_values[i] > 0.001:  # 正在放电
+        if discharge_power_values[i] > 1e-4:  # 正在放电
             if current_segment_start is None:
                 current_segment_start = i
             current_segment.append(i)
@@ -472,11 +507,11 @@ if pulp.LpStatus[prob.status] == "Optimal":
         actual_battery_discharge = discharge_energy[i] / efficiency
 
         # 确定时段类型
-        if charge_power_values[i] > 0.001 and discharge_power_values[i] > 0.001:
+        if charge_power_values[i] > 1e-4 and discharge_power_values[i] > 1e-4:
             period_type = "同时充放电"
-        elif charge_power_values[i] > 0.001:
+        elif charge_power_values[i] > 1e-4:
             period_type = "充电"
-        elif discharge_power_values[i] > 0.001:
+        elif discharge_power_values[i] > 1e-4:
             period_type = "放电"
         else:
             period_type = "空闲"
