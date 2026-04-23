@@ -540,7 +540,7 @@ if pulp.LpStatus[prob.status] == "Optimal":
             '电池电量_kWh': soc_values[i + 1],
             '充电量_kWh': charge_energy[i],  # 从电网吸收
             '放电量_kWh': discharge_energy[i],  # 向电网放出
-            '充电电费_元': charge_cost[i],
+            '充电电费_元': -charge_cost[i],  # 充电成本用负数表示
             '放电电费_元': discharge_revenue[i],
             '时段类型': period_type
         })
