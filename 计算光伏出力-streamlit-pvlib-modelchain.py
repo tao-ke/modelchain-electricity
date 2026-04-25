@@ -155,11 +155,18 @@ with st.sidebar:
         selected_station = st.session_state['station_selector']
         if selected_station in STATIONS:
             params = STATIONS[selected_station]
+            # 更新 session_state 中的站点参数（供气象数据获取使用）
             st.session_state['station_longitude'] = params['longitude']
             st.session_state['station_latitude'] = params['latitude']
             st.session_state['station_altitude'] = params['altitude']
             st.session_state['station_capacity'] = params['capacity']
             st.session_state['station_uncertainty_factor'] = params.get('uncertainty_factor', 0.8)
+            
+            # 同步更新侧边栏输入框的 session_state（关键修复）
+            st.session_state['sidebar_latitude'] = params['latitude']
+            st.session_state['sidebar_longitude'] = params['longitude']
+            st.session_state['sidebar_altitude'] = params['altitude']
+            
             # 如果站点指定了组件，且该组件在组件库中，则更新组件选择和参数
             if params['module'] in LONGI_MODULES:
                 st.session_state['module_selector'] = params['module']
@@ -211,21 +218,32 @@ with st.sidebar:
         value=st.session_state.get('station_latitude', 23.4) if not is_custom else 23.4, 
         min_value=-90.0, 
         max_value=90.0,
+        key='sidebar_latitude',  # 添加 key 使其同步到 session_state
         disabled=False  # 允许编辑
     )
+    # 同步到 session_state 供气象数据获取使用
+    st.session_state['station_latitude'] = latitude
+    
     longitude = st.number_input(
         "经度 (°E)", 
         value=st.session_state.get('station_longitude', 113.2) if not is_custom else 113.2, 
         min_value=-180.0, 
         max_value=180.0,
+        key='sidebar_longitude',  # 添加 key 使其同步到 session_state
         disabled=False  # 允许编辑
     )
+    # 同步到 session_state 供气象数据获取使用
+    st.session_state['station_longitude'] = longitude
+    
     altitude = st.number_input(
         "海拔 (m)", 
         value=st.session_state.get('station_altitude', 91.46) if not is_custom else 91.46, 
         min_value=0.0,
+        key='sidebar_altitude',  # 添加 key 使其同步到 session_state
         disabled=False  # 允许编辑
     )
+    # 同步到 session_state
+    st.session_state['station_altitude'] = altitude
 
     st.subheader("🔧 光伏系统参数")
     system_capacity = st.number_input(
@@ -462,7 +480,7 @@ with st.sidebar:
     }
 
 # 创建选项卡
-weather_tab, module_tab, calc_tab, result_tab, export_tab, forecast_tab = st.tabs(["🌤️ 气象数据上传", "🔆 组件参数管理", "🚀 ModelChain计算", "📊 结果分析", "📤 导出报告", "🔮 光伏出力预测"])
+weather_tab, module_tab, calc_tab, result_tab, export_tab, forecast_tab = st.tabs(["🌤️ 气象数据下载与上传", "🔆 组件参数管理", "🚀 ModelChain计算", "📊 结果分析", "📤 导出报告", "🔮 光伏出力预测"])
 
 with weather_tab:
     st.header("🌤️ 气象数据获取")
@@ -560,18 +578,32 @@ with weather_tab:
                                     if df[col].dtype in [np.float64, np.int64]:
                                         df[col] = df[col].replace(-999.0, np.nan)
                                 
-                                # 列名映射
+                                # 列名映射（支持多种可能的列名格式）
                                 column_mapping = {
+                                    # 标准 NASA POWER 列名
                                     'ALLSKY_SFC_SW_DNI': 'dni',
                                     'ALLSKY_SFC_SW_DWN': 'ghi',
                                     'ALLSKY_SFC_SW_DIFF': 'dhi',
                                     'T2M': 'temp_air',
                                     'WS10M': 'wind_speed',
+                                    # 可能的简写形式
+                                    'DNI': 'dni',
+                                    'GHI': 'ghi', 
+                                    'DHI': 'dhi',
+                                    'T2M': 'temp_air',
+                                    'WS10M': 'wind_speed',
                                 }
                                 
+                                # 智能映射：先检查哪些列存在，然后映射
+                                mapped_columns = []
                                 for old_col, new_col in column_mapping.items():
-                                    if old_col in df.columns:
+                                    if old_col in df.columns and new_col not in df.columns:
                                         df[new_col] = df[old_col]
+                                        mapped_columns.append(old_col)
+                                
+                                # 删除已映射的原列
+                                if mapped_columns:
+                                    df.drop(columns=mapped_columns, inplace=True)
                                 
                                 # 确保必要列存在
                                 required_cols = ['ghi', 'dni', 'dhi', 'temp_air']
@@ -588,17 +620,71 @@ with weather_tab:
                                 
                                 st.success(f"✅ 下载成功！获取 {len(df)} 行数据 ({start_date} ~ {end_date})")
                                 
-                                # 显示数据预览
+                                # 导出 Excel 按钮
+                                # 定义中文列名映射
+                                chinese_columns = {
+                                    'ALLSKY_SFC_SW_DNI': '直接法向辐射 (W/m²)',
+                                    'ALLSKY_SFC_SW_DWN': '全球水平辐射 (W/m²)',
+                                    'ALLSKY_SFC_SW_DIFF': '散射水平辐射 (W/m²)',
+                                    'T2M': '环境温度 (°C)',
+                                    'WS10M': '10米风速 (m/s)',
+                                    'dni': '直接法向辐射 (W/m²)',
+                                    'ghi': '全球水平辐射 (W/m²)',
+                                    'dhi': '散射水平辐射 (W/m²)',
+                                    'temp_air': '环境温度 (°C)',
+                                    'wind_speed': '10米风速 (m/s)'
+                                }
+                                
+                                # 创建带中文列名的副本用于导出
+                                df_export = df.copy()
+                                df_export.reset_index(inplace=True)  # 将 datetime 索引转换为列
+                                # 去除时区信息，Excel 不支持带时区的 datetime
+                                if df_export['datetime'].dt.tz is not None:
+                                    df_export['datetime'] = df_export['datetime'].dt.tz_localize(None)
+                                df_export.rename(columns=chinese_columns, inplace=True)
+                                
+                                # 转换为 Excel 格式
+                                import io
+                                output = io.BytesIO()
+                                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                                    df_export.to_excel(writer, index=False, sheet_name='气象数据')
+                                output.seek(0)
+                                
+                                st.download_button(
+                                    label="⬇️ 导出 Excel 表格",
+                                    data=output,
+                                    file_name=f"气象数据_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    help="导出与数据预览相同格式的 Excel 表格"
+                                )
+                                
+                                # 显示数据预览（带中文列名）
                                 with st.expander("📊 数据预览"):
-                                    st.dataframe(df.head())
+                                    # 定义中文列名映射
+                                    chinese_columns = {
+                                        'ALLSKY_SFC_SW_DNI': '直接法向辐射 (W/m²)',
+                                        'ALLSKY_SFC_SW_DWN': '全球水平辐射 (W/m²)',
+                                        'ALLSKY_SFC_SW_DIFF': '散射水平辐射 (W/m²)',
+                                        'T2M': '环境温度 (°C)',
+                                        'WS10M': '10米风速 (m/s)',
+                                        'dni': '直接法向辐射 (W/m²)',
+                                        'ghi': '全球水平辐射 (W/m²)',
+                                        'dhi': '散射水平辐射 (W/m²)',
+                                        'temp_air': '环境温度 (°C)',
+                                        'wind_speed': '10米风速 (m/s)'
+                                    }
+                                    # 创建带中文列名的副本用于展示
+                                    df_display = df.head().copy()
+                                    df_display.rename(columns=chinese_columns, inplace=True)
+                                    st.dataframe(df_display)
                                 
                                 # 显示数据统计
                                 st.subheader("📈 数据统计信息")
                                 col_a, col_b, col_c, col_d = st.columns(4)
                                 with col_a:
-                                    st.metric("GHI平均值", f"{df['ghi'].mean():.1f} W/m²")
+                                    st.metric("全球水平辐射 (GHI) 平均值", f"{df['ghi'].mean():.1f} W/m²")
                                 with col_b:
-                                    st.metric("DNI平均值", f"{df['dni'].mean():.1f} W/m²")
+                                    st.metric("直接法向辐射 (DNI) 平均值", f"{df['dni'].mean():.1f} W/m²")
                                 with col_c:
                                     st.metric("温度平均值", f"{df['temp_air'].mean():.1f} °C")
                                 with col_d:
@@ -666,10 +752,11 @@ with weather_tab:
                         'WS10M': 'wind_speed',
                     }
 
-                    # 应用列名映射
+                    # 应用列名映射并删除原列
                     for old_col, new_col in column_mapping.items():
                         if old_col in df.columns:
                             df[new_col] = df[old_col]
+                            df.drop(columns=[old_col], inplace=True)  # 删除原英文列
 
                     # 确保必要列存在
                     required_cols = ['ghi', 'dni', 'dhi', 'temp_air']
@@ -685,18 +772,72 @@ with weather_tab:
 
                     st.success(f"✅ 数据加载成功！共 {len(df)} 行数据")
 
-                    # 显示数据预览
+                    # 导出 Excel 按钮
+                    # 定义中文列名映射
+                    chinese_columns = {
+                        'ALLSKY_SFC_SW_DNI': '直接法向辐射 (W/m²)',
+                        'ALLSKY_SFC_SW_DWN': '全球水平辐射 (W/m²)',
+                        'ALLSKY_SFC_SW_DIFF': '散射水平辐射 (W/m²)',
+                        'T2M': '环境温度 (°C)',
+                        'WS10M': '10米风速 (m/s)',
+                        'dni': '直接法向辐射 (W/m²)',
+                        'ghi': '全球水平辐射 (W/m²)',
+                        'dhi': '散射水平辐射 (W/m²)',
+                        'temp_air': '环境温度 (°C)',
+                        'wind_speed': '10米风速 (m/s)'
+                    }
+                    
+                    # 创建带中文列名的副本用于导出
+                    df_export = df.copy()
+                    df_export.reset_index(inplace=True)  # 将 datetime 索引转换为列
+                    # 去除时区信息，Excel 不支持带时区的 datetime
+                    if df_export['datetime'].dt.tz is not None:
+                        df_export['datetime'] = df_export['datetime'].dt.tz_localize(None)
+                    df_export.rename(columns=chinese_columns, inplace=True)
+                    
+                    # 转换为 Excel 格式
+                    import io
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df_export.to_excel(writer, index=False, sheet_name='气象数据')
+                    output.seek(0)
+                    
+                    st.download_button(
+                        label="⬇️ 导出 Excel 表格",
+                        data=output,
+                        file_name=f"气象数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        help="导出与数据预览相同格式的 Excel 表格"
+                    )
+
+                    # 显示数据预览（带中文列名）
                     with st.expander("📊 数据预览"):
-                        st.dataframe(df.head())
+                        # 定义中文列名映射
+                        chinese_columns = {
+                            'ALLSKY_SFC_SW_DNI': '直接法向辐射 (W/m²)',
+                            'ALLSKY_SFC_SW_DWN': '全球水平辐射 (W/m²)',
+                            'ALLSKY_SFC_SW_DIFF': '散射水平辐射 (W/m²)',
+                            'T2M': '环境温度 (°C)',
+                            'WS10M': '10米风速 (m/s)',
+                            'dni': '直接法向辐射 (W/m²)',
+                            'ghi': '全球水平辐射 (W/m²)',
+                            'dhi': '散射水平辐射 (W/m²)',
+                            'temp_air': '环境温度 (°C)',
+                            'wind_speed': '10米风速 (m/s)'
+                        }
+                        # 创建带中文列名的副本用于展示
+                        df_display = df.head().copy()
+                        df_display.rename(columns=chinese_columns, inplace=True)
+                        st.dataframe(df_display)
 
                     # 显示数据统计
                     st.subheader("📈 数据统计信息")
                     col1, col2, col3, col4 = st.columns(4)
 
                     with col1:
-                        st.metric("GHI平均值", f"{df['ghi'].mean():.1f} W/m²")
+                        st.metric("全球水平辐射 (GHI) 平均值", f"{df['ghi'].mean():.1f} W/m²")
                     with col2:
-                        st.metric("DNI平均值", f"{df['dni'].mean():.1f} W/m²")
+                        st.metric("直接法向辐射 (DNI) 平均值", f"{df['dni'].mean():.1f} W/m²")
                     with col3:
                         st.metric("温度平均值", f"{df['temp_air'].mean():.1f} °C")
                     with col4:
@@ -1102,9 +1243,9 @@ with forecast_tab:
                             # 整理预测结果
                             forecast_df = pd.DataFrame({
                                 '预测时间': raw_data.index,
-                                'GHI (W/m²)': raw_data['ghi'],
-                                'DNI (W/m²)': raw_data['dni'],
-                                'DHI (W/m²)': raw_data['dhi'],
+                                '全球水平辐射 (W/m²)': raw_data['ghi'],
+                                '直接法向辐射 (W/m²)': raw_data['dni'],
+                                '散射水平辐射 (W/m²)': raw_data['dhi'],
                                 '气温 (°C)': raw_data['temp_air'],
                                 '风速 (m/s)': raw_data['wind_speed'],
                                 '云量 (%)': raw_data['cloud_cover'],
@@ -1135,6 +1276,12 @@ with forecast_tab:
                 
                 # 为每个站点显示结果
                 for station_name, forecast_df in multi_results.items():
+                    # 获取当前站点的信息（用于获取不确定系数）
+                    if station_name in STATIONS:
+                        station_info = STATIONS[station_name]
+                    else:
+                        station_info = {}
+                        
                     st.divider()
                     st.subheader(f"📍 站点: {station_name}")
                     
@@ -1977,6 +2124,24 @@ with export_tab:
         with col1:
             st.subheader("📥 导出CSV数据")
             if st.button("生成CSV数据"):
+                # 定义中英文列名映射
+                chinese_column_mapping = {
+                    'datetime': '日期时间',
+                    'ghi': '全球水平辐射 (W/m²)',
+                    'dni': '直接法向辐射 (W/m²)',
+                    'dhi': '散射水平辐射 (W/m²)',
+                    'temp_air': '环境温度 (°C)',
+                    'wind_speed': '风速 (m/s)',
+                    'poa_global': '倾斜面总辐射 (W/m²)',
+                    'temp_cell': '组件温度 (°C)',
+                    'p_dc': '直流功率 (W)',
+                    'p_ac': '交流功率 (W)',
+                    'energy_dc_kwh': '直流发电量 (kWh)',
+                    'energy_ac_kwh': '交流发电量 (kWh)',
+                    'p_dc_uncertainty': '不确定直流发电量 (kWh)',
+                    'p_ac_uncertainty': '不确定交流发电量 (kWh)'
+                }
+                
                 # 选择重要列
                 export_cols = ['ghi', 'dni', 'dhi', 'temp_air', 'wind_speed',
                                'poa_global', 'temp_cell', 'p_dc', 'p_ac',
@@ -1984,11 +2149,23 @@ with export_tab:
                 available_cols = [col for col in export_cols if col in df.columns]
 
                 export_df = df[available_cols].copy()
-                csv = export_df.to_csv()
+                
+                # 重命列为中文
+                export_df.rename(columns=chinese_column_mapping, inplace=True)
+                
+                # 将索引（datetime）重置为列并重命名
+                export_df.reset_index(inplace=True)
+                if 'index' in export_df.columns:
+                    export_df.rename(columns={'index': '日期时间'}, inplace=True)
+                elif export_df.index.name:
+                    export_df.reset_index(inplace=True)
+                    export_df.rename(columns={export_df.columns[0]: '日期时间'}, inplace=True)
+                    
+                csv = export_df.to_csv(index=False, encoding='utf-8-sig')
                 
                 st.download_button(
                     label="⬇️ 下载CSV文件",
-                    data=csv,
+                    data=csv.encode('utf-8-sig'),  # 将字符串编码为字节
                     file_name=f"光伏发电量分析_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
