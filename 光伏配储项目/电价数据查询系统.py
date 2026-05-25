@@ -32,7 +32,9 @@ st.markdown("""
 SCRIPT_DIR = Path(__file__).resolve().parent
 PRICE_DATA_DIR = SCRIPT_DIR / "电价数据"
 RANKING_CACHE_FILE = SCRIPT_DIR / ".price_spread_rank_cache.pkl"
+PROVINCIAL_AVG_CACHE_FILE = SCRIPT_DIR / ".provincial_avg_cache.pkl"
 RANKING_CACHE_VERSION = 1
+PROVINCIAL_AVG_CACHE_VERSION = 1
 FACTORY_GROUP_COLUMN = "厂站类型"
 FACTORY_STATION_LABEL = "电厂"
 NON_FACTORY_STATION_LABEL = "电站"
@@ -159,6 +161,52 @@ def load_price_data(file_path_str, modified_time_ns, file_size):
         st.error(f"加载数据失败: {e}")
         return None
 
+
+@st.cache_data(show_spinner="正在计算全省平均电价...")
+def compute_provincial_average(file_keys):
+    """计算全省所有站点各时段平均电价，返回(date_list, time_columns, avg_by_date)"""
+    all_daily_arrays = []  # list of (date_string, 96-element array)
+    date_col_name = None
+
+    for file_path_str, modified_time_ns, file_size in file_keys:
+        df = load_price_data(file_path_str, modified_time_ns, file_size)
+        if df is None or len(df.columns) < 2:
+            continue
+        if date_col_name is None:
+            date_col_name = df.columns[0]
+
+        price_cols = df.columns[1:]
+        if len(price_cols) < 96:
+            continue
+        price_cols = price_cols[:96]
+
+        for _, row in df.iterrows():
+            date_val = row[date_col_name]
+            try:
+                date_str = pd.Timestamp(date_val).strftime('%Y-%m-%d')
+            except Exception:
+                date_str = str(date_val)[:10]
+            prices = pd.to_numeric(row[price_cols], errors='coerce').values.astype(float)
+            if len(prices) == 96 and not np.all(np.isnan(prices)):
+                all_daily_arrays.append((date_str, prices))
+
+    if not all_daily_arrays:
+        return None, None, None
+
+    # Group by date and compute mean
+    date_grouped = {}
+    for date_str, prices in all_daily_arrays:
+        if date_str not in date_grouped:
+            date_grouped[date_str] = []
+        date_grouped[date_str].append(prices)
+
+    date_list = sorted(date_grouped.keys())
+    avg_by_date = np.array([np.mean(date_grouped[d], axis=0) for d in date_list])
+
+    time_columns = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+
+    return date_list, time_columns, avg_by_date
+
 def build_price_file_index(price_files_dict):
     """构造稳定的文件索引，便于缓存排名结果。"""
     file_index = []
@@ -167,6 +215,54 @@ def build_price_file_index(price_files_dict):
         file_path_str, modified_time_ns, file_size = get_file_cache_key(file_path)
         file_index.append((station_name, file_path_str, modified_time_ns, file_size))
     return tuple(file_index)
+
+
+def load_provincial_avg_cache():
+    """读取全省平均电价的磁盘缓存。"""
+    if not PROVINCIAL_AVG_CACHE_FILE.exists():
+        return {}
+    
+    try:
+        with open(PROVINCIAL_AVG_CACHE_FILE, "rb") as cache_file:
+            cache_payload = pickle.load(cache_file)
+        
+        if cache_payload.get("version") != PROVINCIAL_AVG_CACHE_VERSION:
+            return {}
+        
+        return cache_payload.get("entries", {})
+    except Exception:
+        return {}
+
+
+def save_provincial_avg_cache(cache_data):
+    """将全省平均电价缓存写入磁盘。"""
+    cache_payload = {
+        "version": PROVINCIAL_AVG_CACHE_VERSION,
+        "entries": cache_data
+    }
+    temp_cache_file = PROVINCIAL_AVG_CACHE_FILE.with_suffix(".tmp")
+    
+    with open(temp_cache_file, "wb") as cache_file:
+        pickle.dump(cache_payload, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    os.replace(temp_cache_file, PROVINCIAL_AVG_CACHE_FILE)
+
+
+def is_provincial_avg_cache_valid(cached_entry, file_keys):
+    """判断全省平均电价缓存是否仍然有效。"""
+    if not isinstance(cached_entry, dict):
+        return False
+    
+    cached_file_keys = cached_entry.get("file_keys", [])
+    if len(cached_file_keys) != len(file_keys):
+        return False
+    
+    # 检查每个文件的修改时间和大小是否一致
+    for cached_key, current_key in zip(cached_file_keys, file_keys):
+        if cached_key[1] != current_key[1] or cached_key[2] != current_key[2]:
+            return False
+    
+    return True
 
 
 def load_ranking_cache_entries():
@@ -428,6 +524,35 @@ def calculate_all_stations_price_spread(price_file_index):
         "cached_count": cached_count,
         "recomputed_count": len(pending_file_index)
     }
+
+
+def compute_provincial_average_with_cache(file_keys):
+    """带磁盘缓存的全省平均电价计算。"""
+    # 尝试从磁盘缓存加载
+    disk_cache = load_provincial_avg_cache()
+    
+    for cache_key, cached_data in disk_cache.items():
+        if is_provincial_avg_cache_valid(cached_data, file_keys):
+            # 缓存命中，直接返回
+            date_list = cached_data["date_list"]
+            time_columns = cached_data["time_columns"]
+            avg_by_date = np.array(cached_data["avg_by_date"])
+            return date_list, time_columns, avg_by_date
+    
+    # 缓存未命中，重新计算
+    date_list, time_columns, avg_by_date = compute_provincial_average(file_keys)
+    
+    if date_list is not None and time_columns is not None and avg_by_date is not None:
+        # 保存到磁盘缓存
+        cache_data = {
+            "file_keys": file_keys,
+            "date_list": date_list,
+            "time_columns": time_columns,
+            "avg_by_date": avg_by_date.tolist()
+        }
+        save_provincial_avg_cache(cache_data)
+    
+    return date_list, time_columns, avg_by_date
 
 
 def classify_factory_station_group(station_name):
@@ -813,70 +938,109 @@ def main():
     if view_mode == "📊 电价数据查询":
         st.sidebar.header("📍 站点选择")
 
-        filter_mode_options = ["全部站点"]
-        if busbar_types:
-            filter_mode_options.append("按母线查询")
-        if city_types:
-            filter_mode_options.append("按城市查询")
-        if factory_group_types:
-            filter_mode_options.append("按厂站类型查询")
-
-        selected_filter_mode = "全部站点"
-        if len(filter_mode_options) > 1:
-            selected_filter_mode = st.sidebar.selectbox(
-                "查询方式",
-                options=filter_mode_options,
-                index=0
-            )
-
+        # 级联筛选：城市 → 厂站类型 → 母线 → 站点
         filtered_stations = list(price_files.keys())
-        active_group_column = None
-        active_group_value = None
 
-        if selected_filter_mode == "按母线查询":
-            active_group_column = "母线"
-            group_options = busbar_types
-        elif selected_filter_mode == "按城市查询":
-            active_group_column = "城市"
-            group_options = city_types
-        elif selected_filter_mode == "按厂站类型查询":
-            active_group_column = FACTORY_GROUP_COLUMN
-            group_options = factory_group_types
-        else:
-            group_options = []
-
-        if active_group_column:
-            all_group_option = f"全部{active_group_column}"
-            active_group_value = st.sidebar.selectbox(
-                f"选择{active_group_column}",
-                options=[all_group_option] + group_options,
+        # 1. 选择城市
+        if city_types:
+            city_options = ["全部城市"] + sorted(city_types)
+            selected_city = st.sidebar.selectbox(
+                "选择城市",
+                options=city_options,
                 index=0,
-                help=f"选择要查看的{active_group_column}"
+                help="选择要查看的城市"
             )
-
-            if active_group_value != all_group_option:
+            
+            if selected_city != "全部城市":
                 station_group_df = build_station_group_mapping(
                     station_info_df,
-                    active_group_column,
+                    "城市",
                     station_names=price_files.keys()
                 )
-                filtered_stations_df = station_group_df[
-                    station_group_df[active_group_column] == active_group_value
-                ]
-                filtered_stations_list = (
-                    filtered_stations_df['电站名']
-                    .astype(str)
-                    .str.strip()
-                    .tolist()
-                )
-                filtered_stations = [s for s in filtered_stations_list if s in price_files.keys()]
-                st.sidebar.info(f"📊 {active_group_value} 共有 {len(filtered_stations)} 个站点")
+                if station_group_df is not None:
+                    city_stations_df = station_group_df[station_group_df["城市"] == selected_city]
+                    city_stations_list = (
+                        city_stations_df['电站名']
+                        .astype(str)
+                        .str.strip()
+                        .tolist()
+                    )
+                    filtered_stations = [s for s in city_stations_list if s in price_files.keys()]
+                    st.sidebar.info(f"📊 {selected_city} 共有 {len(filtered_stations)} 个站点")
 
+        # 2. 在筛选后的站点中选择厂站类型
+        if factory_group_types and len(filtered_stations) > 0:
+            factory_group_options = get_available_group_values(
+                station_info_df,
+                FACTORY_GROUP_COLUMN,
+                station_names=filtered_stations
+            )
+            
+            if factory_group_options:
+                all_factory_option = f"全部{FACTORY_GROUP_COLUMN}"
+                factory_options = [all_factory_option] + factory_group_options
+                selected_factory = st.sidebar.selectbox(
+                    f"选择{FACTORY_GROUP_COLUMN}",
+                    options=factory_options,
+                    index=0,
+                    help=f"选择要查看的{FACTORY_GROUP_COLUMN}"
+                )
+                
+                if selected_factory != all_factory_option:
+                    station_group_df = build_station_group_mapping(
+                        station_info_df,
+                        FACTORY_GROUP_COLUMN,
+                        station_names=filtered_stations
+                    )
+                    if station_group_df is not None:
+                        factory_stations_df = station_group_df[station_group_df[FACTORY_GROUP_COLUMN] == selected_factory]
+                        factory_stations_list = (
+                            factory_stations_df['电站名']
+                            .astype(str)
+                            .str.strip()
+                            .tolist()
+                        )
+                        filtered_stations = [s for s in factory_stations_list if s in filtered_stations]
+                        st.sidebar.info(f"📊 {selected_factory} 共有 {len(filtered_stations)} 个站点")
+
+        # 3. 在筛选后的站点中选择母线
+        if busbar_types and len(filtered_stations) > 0:
+            busbar_options_filtered = get_available_group_values(
+                station_info_df,
+                "母线",
+                station_names=filtered_stations
+            )
+            
+            if busbar_options_filtered:
+                all_busbar_option = "全部母线"
+                busbar_options = [all_busbar_option] + busbar_options_filtered
+                selected_busbar = st.sidebar.selectbox(
+                    "选择母线",
+                    options=busbar_options,
+                    index=0,
+                    help="选择要查看的母线"
+                )
+                
+                if selected_busbar != all_busbar_option:
+                    station_group_df = build_station_group_mapping(
+                        station_info_df,
+                        "母线",
+                        station_names=filtered_stations
+                    )
+                    if station_group_df is not None:
+                        busbar_stations_df = station_group_df[station_group_df["母线"] == selected_busbar]
+                        busbar_stations_list = (
+                            busbar_stations_df['电站名']
+                            .astype(str)
+                            .str.strip()
+                            .tolist()
+                        )
+                        filtered_stations = [s for s in busbar_stations_list if s in filtered_stations]
+                        st.sidebar.info(f" {selected_busbar} 共有 {len(filtered_stations)} 个站点")
+
+        # 4. 最终站点选择
         if len(filtered_stations) == 0:
-            if active_group_value:
-                st.warning(f"{active_group_value} 下没有可用的电价数据文件！")
-            else:
-                st.warning("当前查询条件下没有可用的电价数据文件！")
+            st.warning("当前筛选条件下没有可用的电价数据文件！")
             return
 
         selected_station = st.sidebar.selectbox(
@@ -895,6 +1059,10 @@ def main():
         if df is None:
             st.error("数据加载失败！")
             return
+
+        # 计算全省平均电价（带磁盘缓存）
+        all_file_keys = [get_file_cache_key(fp) for fp in price_files.values()]
+        prov_dates, prov_time_cols, prov_avg = compute_provincial_average_with_cache(tuple(all_file_keys))
 
         # 显示基本信息
         station_city = get_station_group_value(station_info_df, selected_station, '城市')
@@ -917,13 +1085,13 @@ def main():
         all_prices = df[price_cols].values.flatten()
 
         with col1:
-            st.metric("数据天数", f"{len(df)} 天")
+            st.metric("数据天数 (天)", f"{len(df)}")
         with col2:
-            st.metric("最低电价", f"{all_prices.min():.4f} 元/kWh")
+            st.metric("最低电价 (元/kWh)", f"{all_prices.min():.4f}")
         with col3:
-            st.metric("最高电价", f"{all_prices.max():.4f} 元/kWh")
+            st.metric("最高电价 (元/kWh)", f"{all_prices.max():.4f}")
         with col4:
-            st.metric("平均电价", f"{all_prices.mean():.4f} 元/kWh")
+            st.metric("平均电价 (元/kWh)", f"{all_prices.mean():.4f}")
 
         st.divider()
 
@@ -949,15 +1117,15 @@ def main():
 
         # 提取96个时间节点的电价
         time_columns = price_cols.tolist()
-        prices = selected_row[price_cols].values
+        prices = selected_row[price_cols].values.astype(float)
 
         # 显示选中日期的电价表格
-        st.subheader(f"📋 {selected_date} 电价明细表")
+        st.subheader(f" {selected_date} 电价明细表")
 
         # 创建展示用的DataFrame
         display_df = pd.DataFrame({
             '时间节点': time_columns,
-            '电价 (元/kWh)': prices
+            '电价 (元/kWh)': [round(p, 4) for p in prices]
         })
 
         # 添加时段类型标注
@@ -967,7 +1135,31 @@ def main():
         )
 
         # 显示表格（不使用样式）
-        st.dataframe(display_df, use_container_width=True, height=400)
+        st.dataframe(display_df, use_container_width=True, height=400, column_config={
+            "时间节点": st.column_config.TextColumn("时间节点", width="small"),
+            "电价 (元/kWh)": st.column_config.TextColumn("电价 (元/kWh)", width="medium"),
+            "时段类型": st.column_config.TextColumn("时段类型", width="small")
+        }, hide_index=True)
+
+        # 全省平均电价明细表
+        if prov_avg is not None and prov_dates is not None:
+            prov_date_to_row = {d: i for i, d in enumerate(prov_dates)}
+            if selected_date in prov_date_to_row:
+                prov_prices = prov_avg[prov_date_to_row[selected_date]]
+                st.markdown("---")
+                st.subheader(" 全省平均电价明细表")
+                prov_display_df = pd.DataFrame({
+                    '时间节点': time_columns,
+                    '全省平均电价 (元/kWh)': np.round(prov_prices, 4)
+                })
+                prov_display_df['时段类型'] = prov_display_df['时间节点'].apply(
+                    lambda time_str: get_guangdong_period_type(selected_date_value, time_str)
+                )
+                st.dataframe(prov_display_df, use_container_width=True, height=400, column_config={
+                    "时间节点": st.column_config.TextColumn("时间节点", width="small"),
+                    "全省平均电价 (元/kWh)": st.column_config.TextColumn("全省平均电价 (元/kWh)", width="medium"),
+                    "时段类型": st.column_config.TextColumn("时段类型", width="small")
+                }, hide_index=True)
 
         st.divider()
 
@@ -997,9 +1189,22 @@ def main():
             name='电价区域'
         ))
 
+        # 添加全省平均电价曲线
+        if prov_avg is not None and prov_dates is not None:
+            prov_date_to_row = {d: i for i, d in enumerate(prov_dates)}
+            if selected_date in prov_date_to_row:
+                prov_prices = prov_avg[prov_date_to_row[selected_date]]
+                fig.add_trace(go.Scatter(
+                    x=time_columns,
+                    y=prov_prices,
+                    mode='lines',
+                    name='全省平均电价',
+                    line=dict(color='blue', width=2, dash='dash')
+                ))
+
         # 更新布局
         fig.update_layout(
-            title=f'{selected_date} 电价变化曲线',
+            title=f'{selected_date} 电价变化曲线（{selected_station} vs 全省平均）',
             xaxis_title='时间节点',
             yaxis_title='电价 (元/kWh)',
             hovermode='x unified',
@@ -1041,12 +1246,23 @@ def main():
             x=analysis_df['日期'],
             y=analysis_df['日均电价'],
             mode='lines',
-            name='日均电价',
+            name=f'{selected_station} 日均电价',
             line=dict(color='#2196F3', width=1.5)
         ))
 
+        # 添加全省平均日均电价曲线
+        if prov_avg is not None and prov_dates is not None:
+            prov_daily_avg = prov_avg.mean(axis=1)
+            fig_trend.add_trace(go.Scatter(
+                x=prov_dates,
+                y=prov_daily_avg,
+                mode='lines',
+                name='全省平均日均电价',
+                line=dict(color='red', width=1.5, dash='dash')
+            ))
+
         fig_trend.update_layout(
-            title='全年日均电价趋势',
+            title=f'{selected_station} vs 全省平均 日均电价趋势对比',
             xaxis_title='日期',
             yaxis_title='日均电价 (元/kWh)',
             template='plotly_white',
