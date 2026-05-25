@@ -1164,60 +1164,103 @@ def main():
         st.divider()
 
         # 可视化 - 电价曲线图
-        st.subheader("📈 电价曲线图")
+        st.subheader(" 电价曲线图")
+        
+        # 创建左右两列布局
+        chart_col, metrics_col = st.columns([3, 1])
+        
+        with chart_col:
+            # 创建Plotly图表
+            fig = go.Figure()
 
-        # 创建Plotly图表
-        fig = go.Figure()
+            # 添加电价曲线
+            fig.add_trace(go.Scatter(
+                x=time_columns,
+                y=prices,
+                mode='lines+markers',
+                name='电价',
+                line=dict(color='#FF6B35', width=2),
+                marker=dict(size=4)
+            ))
 
-        # 添加电价曲线
-        fig.add_trace(go.Scatter(
-            x=time_columns,
-            y=prices,
-            mode='lines+markers',
-            name='电价',
-            line=dict(color='#FF6B35', width=2),
-            marker=dict(size=4)
-        ))
+            # 添加填充区域
+            fig.add_trace(go.Scatter(
+                x=time_columns,
+                y=prices,
+                mode='none',
+                fill='tozeroy',
+                fillcolor='rgba(255, 107, 53, 0.1)',
+                name='电价区域'
+            ))
 
-        # 添加填充区域
-        fig.add_trace(go.Scatter(
-            x=time_columns,
-            y=prices,
-            mode='none',
-            fill='tozeroy',
-            fillcolor='rgba(255, 107, 53, 0.1)',
-            name='电价区域'
-        ))
+            # 添加全省平均电价曲线
+            if prov_avg is not None and prov_dates is not None:
+                prov_date_to_row = {d: i for i, d in enumerate(prov_dates)}
+                if selected_date in prov_date_to_row:
+                    prov_prices = prov_avg[prov_date_to_row[selected_date]]
+                    fig.add_trace(go.Scatter(
+                        x=time_columns,
+                        y=prov_prices,
+                        mode='lines',
+                        name='全省平均电价',
+                        line=dict(color='blue', width=2, dash='dash')
+                    ))
 
-        # 添加全省平均电价曲线
-        if prov_avg is not None and prov_dates is not None:
-            prov_date_to_row = {d: i for i, d in enumerate(prov_dates)}
-            if selected_date in prov_date_to_row:
-                prov_prices = prov_avg[prov_date_to_row[selected_date]]
-                fig.add_trace(go.Scatter(
-                    x=time_columns,
-                    y=prov_prices,
-                    mode='lines',
-                    name='全省平均电价',
-                    line=dict(color='blue', width=2, dash='dash')
-                ))
-
-        # 更新布局
-        fig.update_layout(
-            title=f'{selected_date} 电价变化曲线（{selected_station} vs 全省平均）',
-            xaxis_title='时间节点',
-            yaxis_title='电价 (元/kWh)',
-            hovermode='x unified',
-            template='plotly_white',
-            height=500,
-            xaxis=dict(
-                tickangle=45,
-                tickvals=time_columns[::4],  # 每4个点显示一个标签
-                ticktext=[time_columns[i] for i in range(0, len(time_columns), 4)]
+            # 更新布局
+            fig.update_layout(
+                title=f'{selected_date} 电价变化曲线（{selected_station} vs 全省平均）',
+                xaxis_title='时间节点',
+                yaxis_title='电价 (元/kWh)',
+                hovermode='x unified',
+                template='plotly_white',
+                height=500,
+                xaxis=dict(
+                    tickangle=45,
+                    tickvals=time_columns[::4],  # 每4个点显示一个标签
+                    ticktext=[time_columns[i] for i in range(0, len(time_columns), 4)]
+                )
             )
-        )
 
-        st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with metrics_col:
+            # 计算并显示站点电价与全省平均电价的标准差之和
+            if prov_avg is not None and prov_dates is not None:
+                prov_date_to_row = {d: i for i, d in enumerate(prov_dates)}
+                if selected_date in prov_date_to_row:
+                    prov_prices = prov_avg[prov_date_to_row[selected_date]]
+                    
+                    # 计算每个时间节点的标准差
+                    price_diff = np.abs(prices - prov_prices)
+                    std_sum = np.sum(price_diff)
+                    
+                    st.subheader("📊 电价差异分析")
+                    st.divider()
+                    
+                    st.metric(
+                        "标准差之和",
+                        f"{std_sum:.4f}",
+                        help="站点电价与全省平均电价在每个时间节点的绝对差值之和"
+                    )
+                    
+                    st.metric(
+                        "平均标准差",
+                        f"{std_sum / len(prices):.4f}",
+                        help="标准差之和的平均值"
+                    )
+                    
+                    max_diff_idx = np.argmax(price_diff)
+                    st.metric(
+                        "最大差异节点",
+                        time_columns[max_diff_idx],
+                        help=f"差异最大的时间节点（差值：{price_diff[max_diff_idx]:.4f} 元/kWh）"
+                    )
+                    
+                    # 添加额外信息
+                    st.divider()
+                    st.markdown(f"**时间节点数：** {len(prices)}")
+                    st.markdown(f"**最小差值：** {np.min(price_diff):.4f}")
+                    st.markdown(f"**最大差值：** {np.max(price_diff):.4f}")
 
         st.divider()
 
