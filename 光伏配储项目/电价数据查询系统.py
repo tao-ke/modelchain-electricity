@@ -9,6 +9,10 @@ import os
 import pulp
 import numpy as np
 import math
+import hashlib
+from collections import defaultdict
+import json
+import psycopg2
 
 # 页面配置必须放在最前面
 st.set_page_config(
@@ -31,14 +35,25 @@ st.markdown("""
 # 定义脚本目录和电价数据目录
 SCRIPT_DIR = Path(__file__).resolve().parent
 PRICE_DATA_DIR = SCRIPT_DIR / "电价数据"
-RANKING_CACHE_FILE = SCRIPT_DIR / ".price_spread_rank_cache.pkl"
-PROVINCIAL_AVG_CACHE_FILE = SCRIPT_DIR / ".provincial_avg_cache.pkl"
+CACHE_DIR = SCRIPT_DIR / ".cache"
+CACHE_DIR.mkdir(exist_ok=True)
+RANKING_CACHE_FILE = CACHE_DIR / ".price_spread_rank_cache.pkl"
+PROVINCIAL_AVG_CACHE_FILE = CACHE_DIR / ".provincial_avg_cache.pkl"
 RANKING_CACHE_VERSION = 1
-PROVINCIAL_AVG_CACHE_VERSION = 1
+PROVINCIAL_AVG_CACHE_VERSION = 2
 FACTORY_GROUP_COLUMN = "厂站类型"
 FACTORY_STATION_LABEL = "电厂"
 NON_FACTORY_STATION_LABEL = "电站"
 GUANGDONG_SHARP_PEAK_MONTHS = {7, 8, 9}
+
+# TimescaleDB 数据库连接配置
+DB_CONFIG = {
+    'dbname': 'postgres',
+    'user': 'kehuitao',
+    'password': '123456',
+    'host': '192.168.100.8',
+    'port': '5432'
+}
 
 # 储能优化参数配置
 STORAGE_CONFIG = {
@@ -82,6 +97,361 @@ def load_station_info():
         return None
     except Exception:
         return None
+
+
+# 数据库查询函数
+def get_db_connection():
+    """获取数据库连接"""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except Exception as e:
+        st.error(f"数据库连接失败: {e}")
+        return None
+
+
+def check_db_available():
+    """检测数据库是否可用，返回(True, None)或(False, 错误信息)"""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG, connect_timeout=5)
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+@st.cache_data(show_spinner=False)
+def get_db_station_list():
+    """从数据库获取所有站点列表"""
+    conn = get_db_connection()
+    if conn is None:
+        return []
+    
+    try:
+        query = """
+            SELECT DISTINCT station
+            FROM real_time_electricity_price
+            ORDER BY station
+        """
+        df = pd.read_sql_query(query, conn)
+        return df['station'].tolist()
+    except Exception as e:
+        st.error(f"查询站点列表失败: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def get_db_available_years():
+    """从数据库获取可用的年份列表"""
+    conn = get_db_connection()
+    if conn is None:
+        return []
+    
+    try:
+        query = """
+            SELECT DISTINCT EXTRACT(YEAR FROM time)::integer AS year
+            FROM real_time_electricity_price
+            ORDER BY year DESC
+        """
+        df = pd.read_sql_query(query, conn)
+        return df['year'].tolist()
+    except Exception as e:
+        st.error(f"查询年份列表失败: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def load_price_data_from_db(station_name, year):
+    """从数据库加载指定站点和年份的电价数据
+    
+    Args:
+        station_name: 站点名称
+        year: 年份 (int)
+    
+    Returns:
+        DataFrame: 包含日期列和96个时段电价列的宽格式数据
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return None
+    
+    try:
+        start_date = f"{year}-01-01"
+        end_date = f"{year + 1}-01-01"
+        
+        query = """
+            SELECT time, price
+            FROM real_time_electricity_price
+            WHERE station = %s
+              AND time >= %s AND time < %s
+            ORDER BY time
+        """
+        df = pd.read_sql_query(query, conn, params=(station_name, start_date, end_date))
+        
+        if df.empty:
+            return None
+        
+        # 转换时间格式
+        df['time'] = pd.to_datetime(df['time'])
+        df['date'] = df['time'].dt.date
+        df['time_str'] = df['time'].dt.strftime('%H:%M')
+        
+        # 透视表：将长格式转换为宽格式
+        pivot_df = df.pivot_table(
+            index='date',
+            columns='time_str',
+            values='price',
+            aggfunc='first'
+        )
+        
+        # 重置索引并重命名列
+        pivot_df = pivot_df.reset_index()
+        pivot_df.columns.name = None
+        
+        # 按时间排序列（00:00, 00:15, 00:30, ...）
+        time_cols = [col for col in pivot_df.columns if col != 'date']
+        time_cols_sorted = sorted(time_cols)
+        pivot_df = pivot_df[['date'] + time_cols_sorted]
+        
+        # 将date列转换为datetime类型
+        pivot_df['date'] = pd.to_datetime(pivot_df['date'])
+        
+        return pivot_df
+    except Exception as e:
+        st.error(f"从数据库加载数据失败: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner="正在计算全省平均电价...")
+def compute_provincial_average_from_db(station_year_pairs):
+    """从数据库计算全省所有站点各时段平均电价
+    
+    Args:
+        station_year_pairs: [(station_name, year), ...] 站点和年份的元组列表
+    
+    Returns:
+        (date_list, time_columns, avg_by_date, failed_stations)
+    """
+    # 先检测数据库连接
+    db_available, db_error = check_db_available()
+    if not db_available:
+        st.error(f"数据库连接断开: {db_error}")
+        return None, None, None, []
+    
+    all_daily_arrays = []
+    failed_stations = []
+    
+    for station_name, year in station_year_pairs:
+        df = load_price_data_from_db(station_name, year)
+        if df is None:
+            failed_stations.append(station_name)
+            continue
+        
+        if len(df.columns) < 2:
+            failed_stations.append(station_name)
+            continue
+        
+        date_col = df.columns[0]
+        price_cols = df.columns[1:]
+        
+        if len(price_cols) < 96:
+            failed_stations.append(station_name)
+            continue
+        price_cols = price_cols[:96]
+        
+        for _, row in df.iterrows():
+            date_val = row[date_col]
+            try:
+                date_str = pd.Timestamp(date_val).strftime('%Y-%m-%d')
+            except Exception:
+                date_str = str(date_val)[:10]
+            prices = pd.to_numeric(row[price_cols], errors='coerce').values.astype(float)
+            if len(prices) == 96 and not np.all(np.isnan(prices)):
+                all_daily_arrays.append((date_str, prices))
+    
+    if not all_daily_arrays:
+        return None, None, None, failed_stations
+    
+    # Group by date and compute mean
+    date_grouped = {}
+    for date_str, prices in all_daily_arrays:
+        if date_str not in date_grouped:
+            date_grouped[date_str] = []
+        date_grouped[date_str].append(prices)
+    
+    date_list = sorted(date_grouped.keys())
+    avg_by_date = np.array([np.mean(date_grouped[d], axis=0) for d in date_list])
+    
+    time_columns = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+    
+    return date_list, time_columns, avg_by_date, failed_stations
+
+
+def _calculate_station_stats_from_db(station_name, year):
+    """从数据库计算单个站点的电价差统计"""
+    df = load_price_data_from_db(station_name, year)
+    if df is None or len(df.columns) < 2:
+        return None
+    
+    price_data = df.iloc[:, 1:]  # 除日期列外的所有列
+    if price_data.empty:
+        return None
+    
+    daily_max = price_data.max(axis=1)
+    daily_min = price_data.min(axis=1)
+    daily_spread = daily_max - daily_min
+    all_prices = price_data.to_numpy().flatten()
+    
+    return {
+        '日均电价差': round(daily_spread.mean(), 4),
+        '全年最高电价差': round(daily_spread.max(), 4),
+        '全年最低电价差': round(daily_spread.min(), 4),
+        '全年平均电价': round(all_prices.mean(), 4),
+        '数据天数': len(df)
+    }
+
+
+@st.cache_data(show_spinner=False)
+def calculate_all_stations_price_spread_from_db(station_year_pairs):
+    """从数据库计算所有站点的电价差统计数据
+    
+    Args:
+        station_year_pairs: [(station_name, year), ...] 站点和年份的元组列表
+    
+    Returns:
+        (stats_df, failed_stations, cache_summary)
+    """
+    if not station_year_pairs:
+        return pd.DataFrame(), (), {"cached_count": 0, "recomputed_count": 0}
+    
+    station_stats = []
+    failed_stations = []
+    
+    for station_name, year in station_year_pairs:
+        try:
+            stats = _calculate_station_stats_from_db(station_name, year)
+            if stats is None:
+                failed_stations.append((station_name, "无数据"))
+                continue
+            
+            station_stats.append({
+                '站点名称': station_name,
+                **stats
+            })
+        except Exception as e:
+            failed_stations.append((station_name, str(e)))
+    
+    if not station_stats:
+        return pd.DataFrame(), tuple(failed_stations), {
+            "cached_count": 0,
+            "recomputed_count": len(station_year_pairs)
+        }
+    
+    stats_df = pd.DataFrame(station_stats)
+    stats_df = stats_df.sort_values('日均电价差', ascending=False).reset_index(drop=True)
+    stats_df['排名'] = range(1, len(stats_df) + 1)
+    stats_df = stats_df[['排名', '站点名称', '日均电价差', '全年最高电价差', '全年最低电价差', '全年平均电价', '数据天数']]
+    
+    return stats_df, tuple(failed_stations), {
+        "cached_count": 0,
+        "recomputed_count": len(station_year_pairs)
+    }
+
+
+def export_db_data_to_excel(station_name, year, progress_callback=None):
+    """将数据库中的电价数据导出到本地Excel文件
+    
+    Args:
+        station_name: 站点名称
+        year: 年份
+        progress_callback: 进度回调函数 callback(current, total, message)
+    
+    Returns:
+        (success, message, file_path)
+    """
+    try:
+        # 从数据库加载数据
+        if progress_callback:
+            progress_callback(0, 100, f"正在从数据库加载 {station_name} 的数据...")
+        
+        df = load_price_data_from_db(station_name, year)
+        if df is None:
+            return False, f"无法从数据库加载 {station_name} 的 {year} 年数据", None
+        
+        if progress_callback:
+            progress_callback(30, 100, "数据加载完成，正在准备保存...")
+        
+        # 创建保存目录
+        save_dir = PRICE_DATA_DIR / str(year)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 生成文件名（只包含站点名）
+        file_name = f"{station_name}.xlsx"
+        file_path = save_dir / file_name
+        
+        if progress_callback:
+            progress_callback(50, 100, f"正在保存到 {file_name}...")
+        
+        # 保存到Excel（覆盖已有文件）
+        df.to_excel(file_path, index=False, engine='openpyxl')
+        
+        if progress_callback:
+            progress_callback(100, 100, "保存完成！")
+        
+        return True, f"成功导出到 {file_path}", str(file_path)
+    except Exception as e:
+        return False, f"导出失败: {str(e)}", None
+
+
+def export_all_db_data_to_excel(station_list, year, progress_placeholder=None):
+    """批量将数据库中的电价数据导出到本地Excel文件
+    
+    Args:
+        station_list: 站点名称列表
+        year: 年份
+        progress_placeholder: Streamlit placeholder用于显示进度
+    
+    Returns:
+        (success_count, fail_count, failed_stations)
+    """
+    success_count = 0
+    fail_count = 0
+    failed_stations = []
+    total = len(station_list)
+    
+    # 创建进度条
+    if progress_placeholder:
+        progress_bar = progress_placeholder.progress(0)
+        status_text = progress_placeholder.empty()
+    
+    for i, station_name in enumerate(station_list):
+        # 更新进度
+        progress = int((i / total) * 100)
+        if progress_placeholder:
+            progress_bar.progress(progress)
+            status_text.text(f"正在处理 ({i+1}/{total}): {station_name}")
+        
+        # 导出单个站点
+        success, message, _ = export_db_data_to_excel(station_name, year)
+        if success:
+            success_count += 1
+        else:
+            fail_count += 1
+            failed_stations.append((station_name, message))
+    
+    # 完成
+    if progress_placeholder:
+        progress_bar.progress(100)
+        status_text.text(f"导出完成！成功: {success_count}, 失败: {fail_count}")
+    
+    return success_count, fail_count, failed_stations
+
 
 def sort_price_data_dirs(directories):
     """按年份倒序排列目录，非纯数字目录排在后面。"""
@@ -248,21 +618,56 @@ def save_provincial_avg_cache(cache_data):
     os.replace(temp_cache_file, PROVINCIAL_AVG_CACHE_FILE)
 
 
-def is_provincial_avg_cache_valid(cached_entry, file_keys):
-    """判断全省平均电价缓存是否仍然有效。"""
+def _provincial_avg_cache_key(file_keys):
+    """根据文件索引生成稳定的缓存键（MD5），用于区分不同年份/目录。"""
+    key_parts = [f"{fp}|{mtime}|{size}" for fp, mtime, size in file_keys]
+    raw = "\n".join(key_parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _is_provincial_avg_entry_valid(cached_entry, file_keys):
+    """校验单条全省平均电价缓存条目是否仍然有效。"""
     if not isinstance(cached_entry, dict):
         return False
-    
+
     cached_file_keys = cached_entry.get("file_keys", [])
     if len(cached_file_keys) != len(file_keys):
         return False
-    
-    # 检查每个文件的修改时间和大小是否一致
+
     for cached_key, current_key in zip(cached_file_keys, file_keys):
         if cached_key[1] != current_key[1] or cached_key[2] != current_key[2]:
             return False
-    
+
     return True
+
+
+def compute_provincial_average_with_cache(file_keys):
+    """带磁盘缓存的全省平均电价计算，支持多年份缓存共存。"""
+    cache_key = _provincial_avg_cache_key(file_keys)
+    disk_cache = load_provincial_avg_cache()
+
+    # 按哈希键查找对应条目
+    cached_entry = disk_cache.get(cache_key)
+    if cached_entry is not None and _is_provincial_avg_entry_valid(cached_entry, file_keys):
+        date_list = cached_entry["date_list"]
+        time_columns = cached_entry["time_columns"]
+        avg_by_date = np.array(cached_entry["avg_by_date"])
+        return date_list, time_columns, avg_by_date
+
+    # 缓存未命中，重新计算
+    date_list, time_columns, avg_by_date = compute_provincial_average(file_keys)
+
+    if date_list is not None and time_columns is not None and avg_by_date is not None:
+        # 将新条目合并到已有缓存中（保留其他年份的缓存）
+        disk_cache[cache_key] = {
+            "file_keys": file_keys,
+            "date_list": date_list,
+            "time_columns": time_columns,
+            "avg_by_date": avg_by_date.tolist()
+        }
+        save_provincial_avg_cache(disk_cache)
+
+    return date_list, time_columns, avg_by_date
 
 
 def load_ranking_cache_entries():
@@ -526,33 +931,7 @@ def calculate_all_stations_price_spread(price_file_index):
     }
 
 
-def compute_provincial_average_with_cache(file_keys):
-    """带磁盘缓存的全省平均电价计算。"""
-    # 尝试从磁盘缓存加载
-    disk_cache = load_provincial_avg_cache()
-    
-    for cache_key, cached_data in disk_cache.items():
-        if is_provincial_avg_cache_valid(cached_data, file_keys):
-            # 缓存命中，直接返回
-            date_list = cached_data["date_list"]
-            time_columns = cached_data["time_columns"]
-            avg_by_date = np.array(cached_data["avg_by_date"])
-            return date_list, time_columns, avg_by_date
-    
-    # 缓存未命中，重新计算
-    date_list, time_columns, avg_by_date = compute_provincial_average(file_keys)
-    
-    if date_list is not None and time_columns is not None and avg_by_date is not None:
-        # 保存到磁盘缓存
-        cache_data = {
-            "file_keys": file_keys,
-            "date_list": date_list,
-            "time_columns": time_columns,
-            "avg_by_date": avg_by_date.tolist()
-        }
-        save_provincial_avg_cache(cache_data)
-    
-    return date_list, time_columns, avg_by_date
+
 
 
 def classify_factory_station_group(station_name):
@@ -861,42 +1240,225 @@ def run_optimization_cached(file_path_or_none, P, battery_capacity, efficiency):
     return date_list, all_results, all_summaries
 
 
+@st.cache_data(show_spinner="正在优化储能调度...")
+def run_optimization_cached_from_db(station_name, year, P, battery_capacity, efficiency):
+    """从数据库加载数据并进行储能优化"""
+    config = {
+        'P': P, 'battery_capacity': battery_capacity,
+        'initial_soc': 0, 'efficiency': efficiency,
+        'dt': 0.25, 'num': 96
+    }
+    
+    # 从数据库加载数据
+    df = load_price_data_from_db(station_name, year)
+    if df is None:
+        raise ValueError(f"无法从数据库加载 {station_name} 的 {year} 年数据")
+    
+    start_col = 1 if len(df.columns) > 96 and not pd.api.types.is_numeric_dtype(df.iloc[:, 0]) else 0
+    all_prices = df.iloc[:, start_col:start_col + 96].values.astype(float)
+
+    date_list = []
+    if start_col == 1:
+        for d in df.iloc[:, 0].values:
+            if pd.isna(d):
+                date_list.append('')
+            elif isinstance(d, pd.Timestamp):
+                date_list.append(d.strftime('%Y-%m-%d'))
+            elif isinstance(d, str):
+                ds = str(d).strip()
+                date_list.append(ds.split('T')[0] if 'T' in ds else (ds.split(' ')[0] if ' ' in ds else ds[:10]))
+            else:
+                date_list.append(str(d)[:10])
+    else:
+        date_list = [f'第{i+1}天' for i in range(len(df))]
+
+    num_days = len(all_prices)
+    all_results = []
+    all_summaries = []
+    current_soc = 0.0
+
+    for day_idx in range(num_days):
+        price = all_prices[day_idx, :]
+        day_start_soc = current_soc
+        prob, result = optimize_single_day(price, day_idx, current_soc, config)
+
+        if pulp.LpStatus[prob.status] == "Optimal":
+            var_dict = {v.name: v for v in prob.variables()}
+            charge_power_values = [float(pulp.value(var_dict[f"charge_{i}"])) for i in range(96)]
+            discharge_power_values = [float(pulp.value(var_dict[f"discharge_{i}"])) for i in range(96)]
+            soc_values = [float(pulp.value(var_dict[f"soc_{i}"])) for i in range(97)]
+            current_soc = float(pulp.value(var_dict[f"soc_{96}"]))
+            total_revenue = float(pulp.value(prob.objective))
+
+            dt = 0.25
+            for i in range(96):
+                hour = i * dt
+                time_str = f"{int(hour):02d}:{int((hour - int(hour)) * 60):02d}"
+                if charge_power_values[i] > 1e-4:
+                    period_type = "充电"
+                elif discharge_power_values[i] > 1e-4:
+                    period_type = "放电"
+                else:
+                    period_type = "空闲"
+                all_results.append({
+                    '日期': date_list[day_idx], '时间': time_str,
+                    '电价_元/kWh': float(price[i]),
+                    '充电功率_kW': charge_power_values[i],
+                    '放电功率_kW': discharge_power_values[i],
+                    '净功率_kW': discharge_power_values[i] - charge_power_values[i],
+                    '电池电量_kWh': soc_values[i + 1],
+                    '时段类型': period_type
+                })
+
+            total_charge = sum(charge_power_values[i] * dt for i in range(96))
+            total_discharge = sum(discharge_power_values[i] * dt for i in range(96))
+            all_summaries.append({
+                '日期': date_list[day_idx],
+                '日收益_元': total_revenue,
+                '初始电量_kWh': day_start_soc,
+                '最终电量_kWh': current_soc,
+                '充电量_kWh': total_charge,
+                '放电量_kWh': total_discharge
+            })
+
+    return date_list, all_results, all_summaries
+
+
 # 主程序
 def main():
     # 加载电站信息
     station_info_df = load_station_info()
 
-    price_dir_options = get_price_data_dir_options()
-    if not price_dir_options:
-        st.warning("未找到电价数据目录！")
-        st.info(f"请先创建电价数据目录: `{PRICE_DATA_DIR}`")
-        return
-
-    price_dir_labels = [label for label, _ in price_dir_options]
-    default_price_dir_index = 0
-
-    selected_price_dir_label = st.sidebar.selectbox(
-        "电价数据年份",
-        price_dir_labels,
-        index=default_price_dir_index,
-        help="读取“电价数据”目录下对应年份文件夹中的站点电价表。",
+    # 数据源选择
+    st.sidebar.header("📂 数据源配置")
+    data_source = st.sidebar.radio(
+        "选择数据源",
+        options=["数据库", "Excel文件"],
+        index=0,
+        help="选择从数据库或Excel文件读取电价数据"
     )
-    selected_price_dir = dict(price_dir_options)[selected_price_dir_label]
 
-    # 扫描电价文件
-    price_files = scan_price_files(selected_price_dir)
+    # 检测数据库可用性
+    db_available, db_error = check_db_available() if data_source == "数据库" else (False, None)
+    
+    # 数据库不可用时自动切换到Excel模式
+    if data_source == "数据库" and not db_available:
+        st.warning(f"数据库连接失败: {db_error}")
+        st.info("已自动切换到Excel文件模式，请确保电价数据目录中有数据文件。")
+        data_source = "Excel文件"
 
-    if not price_files:
-        st.warning("未找到电价数据文件！")
-        st.info(f"请在以下目录放置电价文件: `{selected_price_dir}`")
-        st.markdown("""
-        **文件格式要求：**
-        - Excel格式 (.xlsx/.xls)
-        - 文件放在 `电价数据/年份` 文件夹内，例如 `电价数据/2025`
-        - 第一列为日期列
-        - 后续96列为00:00到23:45的96个时间节点电价数据
-        """)
-        return
+    if data_source == "数据库":
+        # 从数据库加载数据
+        db_stations = get_db_station_list()
+        if not db_stations:
+            st.warning("数据库中未找到站点数据！")
+            st.info("请检查数据库连接配置或确认数据库中已有电价数据。")
+            return
+        
+        db_years = get_db_available_years()
+        if not db_years:
+            st.warning("数据库中未找到可用的年份数据！")
+            return
+        
+        # 年份选择
+        selected_year = st.sidebar.selectbox(
+            "选择年份",
+            options=db_years,
+            index=0,
+            help="选择要查询的年份"
+        )
+        
+        # 构建price_files字典（兼容现有逻辑）
+        # 使用站点名称作为键，None作为文件路径（因为从数据库加载）
+        price_files = {station: None for station in db_stations}
+        
+        # 保存数据源信息供后续使用
+        st.session_state['data_source'] = 'database'
+        st.session_state['selected_year'] = selected_year
+        
+        # 数据同步功能
+        st.sidebar.divider()
+        st.sidebar.subheader("💾 数据同步")
+        
+        # 选择要同步的站点
+        sync_mode = st.sidebar.radio(
+            "同步范围",
+            options=["全部站点", "选择站点"],
+            horizontal=True,
+            help="选择要同步到本地的站点范围"
+        )
+        
+        if sync_mode == "选择站点":
+            sync_stations = st.sidebar.multiselect(
+                "选择站点",
+                options=db_stations,
+                default=[],
+                help="选择要同步的站点"
+            )
+        else:
+            sync_stations = db_stations
+        
+        # 同步按钮
+        if st.sidebar.button("📤 同步到本地Excel", type="primary", disabled=len(sync_stations) == 0):
+            st.sidebar.divider()
+            st.sidebar.subheader("📊 同步进度")
+            progress_placeholder = st.sidebar.empty()
+            
+            # 执行同步
+            success_count, fail_count, failed_stations = export_all_db_data_to_excel(
+                sync_stations, selected_year, progress_placeholder
+            )
+            
+            # 显示结果
+            if fail_count == 0:
+                st.sidebar.success(f"✅ 同步完成！成功导出 {success_count} 个站点的数据")
+            else:
+                st.sidebar.warning(f"⚠️ 同步完成：成功 {success_count} 个，失败 {fail_count} 个")
+                if failed_stations:
+                    with st.sidebar.expander("查看失败详情"):
+                        for station, error in failed_stations[:10]:
+                            st.write(f"- {station}: {error}")
+                        if len(failed_stations) > 10:
+                            st.write(f"... 还有 {len(failed_stations) - 10} 个站点")
+            
+            # 同步后刷新文件列表
+            st.sidebar.button("🔄 刷新文件列表", on_click=st.cache_data.clear)
+        
+    else:
+        # 从Excel文件加载数据（原有逻辑）
+        price_dir_options = get_price_data_dir_options()
+        if not price_dir_options:
+            st.warning("未找到电价数据目录！")
+            st.info(f"请先创建电价数据目录: `{PRICE_DATA_DIR}`")
+            return
+
+        price_dir_labels = [label for label, _ in price_dir_options]
+        default_price_dir_index = 0
+
+        selected_price_dir_label = st.sidebar.selectbox(
+            "电价数据年份",
+            price_dir_labels,
+            index=default_price_dir_index,
+            help='读取"电价数据"目录下对应年份文件夹中的站点电价表。',
+        )
+        selected_price_dir = dict(price_dir_options)[selected_price_dir_label]
+
+        # 扫描电价文件
+        price_files = scan_price_files(selected_price_dir)
+
+        if not price_files:
+            st.warning("未找到电价数据文件！")
+            st.info(f"请在以下目录放置电价文件: `{selected_price_dir}`")
+            st.markdown("""
+            **文件格式要求：**
+            - Excel格式 (.xlsx/.xls)
+            - 文件放在 `电价数据/年份` 文件夹内，例如 `电价数据/2025`
+            - 第一列为日期列
+            - 后续96列为00:00到23:45的96个时间节点电价数据
+            """)
+            return
+        
+        st.session_state['data_source'] = 'excel'
 
     has_busbar_info = (
         station_info_df is not None
@@ -1053,16 +1615,46 @@ def main():
         selected_file = price_files[selected_station]
 
         # 加载数据
+        data_source = st.session_state.get('data_source', 'excel')
+        
         with st.spinner("正在加载数据..."):
-            df = load_price_data(*get_file_cache_key(selected_file))
+            if data_source == 'database':
+                # 从数据库加载数据
+                selected_year = st.session_state.get('selected_year')
+                df = load_price_data_from_db(selected_station, selected_year)
+            else:
+                # 从Excel文件加载数据
+                df = load_price_data(*get_file_cache_key(selected_file))
 
         if df is None:
             st.error("数据加载失败！")
             return
 
         # 计算全省平均电价（带磁盘缓存）
-        all_file_keys = [get_file_cache_key(fp) for fp in price_files.values()]
-        prov_dates, prov_time_cols, prov_avg = compute_provincial_average_with_cache(tuple(all_file_keys))
+        if data_source == 'database':
+            # 数据库模式：直接计算全省平均
+            selected_year = st.session_state.get('selected_year')
+            all_db_keys = [(station, selected_year) for station in price_files.keys()]
+            prov_dates, prov_time_cols, prov_avg, failed_stations = compute_provincial_average_from_db(all_db_keys)
+            
+            # 显示失败站点提示和重新加载按钮
+            if failed_stations:
+                st.warning(f"以下 {len(failed_stations)} 个站点数据加载失败，已跳过: {', '.join(failed_stations[:5])}{'...' if len(failed_stations) > 5 else ''}")
+                
+                col_reload, col_info = st.columns([1, 3])
+                with col_reload:
+                    if st.button("🔄 重新加载失败站点", key="reload_failed_stations"):
+                        # 清除相关缓存
+                        compute_provincial_average_from_db.clear()
+                        for station in failed_stations:
+                            load_price_data_from_db.clear(station, selected_year)
+                        st.rerun()
+                with col_info:
+                    st.info("点击按钮重新加载失败的站点数据")
+        else:
+            # Excel模式：使用原有缓存逻辑
+            all_file_keys = [get_file_cache_key(fp) for fp in price_files.values()]
+            prov_dates, prov_time_cols, prov_avg = compute_provincial_average_with_cache(tuple(all_file_keys))
 
         # 显示基本信息
         station_city = get_station_group_value(station_info_df, selected_station, '城市')
@@ -1264,8 +1856,467 @@ def main():
 
         st.divider()
 
+        # 价差规律分析
+        if pd.api.types.is_datetime64_any_dtype(df[date_col]):
+            st.subheader("🔍 价差规律分析")
+            
+            # 计算每日价差
+            df_price_spread = df.copy()
+            df_price_spread['日期'] = df_price_spread[date_col]
+            df_price_spread['日最高电价'] = df_price_spread[price_cols].max(axis=1)
+            df_price_spread['日最低电价'] = df_price_spread[price_cols].min(axis=1)
+            df_price_spread['日电价差'] = df_price_spread['日最高电价'] - df_price_spread['日最低电价']
+            df_price_spread['日均电价'] = df_price_spread[price_cols].mean(axis=1)
+            df_price_spread['月份'] = df_price_spread['日期'].dt.month
+            df_price_spread['季度'] = df_price_spread['日期'].dt.quarter
+            df_price_spread['星期'] = df_price_spread['日期'].dt.dayofweek  # 0=周一, 6=周日
+            df_price_spread['是否周末'] = df_price_spread['星期'].apply(lambda x: '周末' if x >= 5 else '工作日')
+            
+            # 创建Tabs
+            tab1, tab2, tab3, tab4 = st.tabs(["日内价差规律", "工作日/周末对比", "月度价差趋势", "季度价差对比"])
+            
+            with tab1:
+                st.markdown("### 📊 日内电价差分布分析")
+                st.info("💡 **日内电价差** = 每日最高电价 - 每日最低电价，反映每天电价的最大波动幅度")
+                
+                # 获取日电价差数据
+                daily_spread = df_price_spread['日电价差']
+                
+                # 统计信息
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("平均日电价差", f"{daily_spread.mean():.4f} 元/kWh")
+                with col2:
+                    st.metric("最大日电价差", f"{daily_spread.max():.4f} 元/kWh")
+                with col3:
+                    st.metric("最小日电价差", f"{daily_spread.min():.4f} 元/kWh")
+                with col4:
+                    st.metric("价差标准差", f"{daily_spread.std():.4f}")
+                
+                # 绘制日电价差分布直方图
+                fig_hist = go.Figure()
+                
+                fig_hist.add_trace(go.Histogram(
+                    x=daily_spread,
+                    nbinsx=50,
+                    name='日电价差分布',
+                    marker_color='#FF6B35',
+                    opacity=0.7
+                ))
+                
+                # 添加平均线
+                fig_hist.add_vline(
+                    x=daily_spread.mean(),
+                    line_dash="dash",
+                    line_color="red",
+                    annotation_text=f"平均值: {daily_spread.mean():.4f}",
+                    annotation_position="top right"
+                )
+                
+                fig_hist.update_layout(
+                    title='日电价差分布直方图',
+                    xaxis_title='日电价差 (元/kWh)',
+                    yaxis_title='天数',
+                    template='plotly_white',
+                    height=400
+                )
+                
+                st.plotly_chart(fig_hist, use_container_width=True)
+                
+                # 绘制箱线图
+                st.markdown("### 📦 日电价差箱线图")
+                
+                fig_box = go.Figure()
+                
+                fig_box.add_trace(go.Box(
+                    y=daily_spread,
+                    name='日电价差',
+                    marker_color='#FF6B35',
+                    boxmean=True,
+                    boxpoints='outliers'
+                ))
+                
+                fig_box.update_layout(
+                    title='日电价差箱线图（显示异常值）',
+                    yaxis_title='日电价差 (元/kWh)',
+                    template='plotly_white',
+                    height=400
+                )
+                
+                st.plotly_chart(fig_box, use_container_width=True)
+                
+                # 分位数分析
+                st.markdown("### 📊 价差分位数统计")
+                
+                quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+                quantile_values = daily_spread.quantile(quantiles)
+                
+                quantile_df = pd.DataFrame({
+                    '分位数': [f"{int(q*100)}%" for q in quantiles],
+                    '价差值 (元/kWh)': quantile_values.round(4).values,
+                    '说明': [
+                        '仅5%的天数价差低于此值',
+                        '仅10%的天数价差低于此值',
+                        '25%的天数价差低于此值（下四分位数）',
+                        '中位数（50%的天数价差低于此值）',
+                        '75%的天数价差低于此值（上四分位数）',
+                        '90%的天数价差低于此值',
+                        '仅5%的天数价差高于此值'
+                    ]
+                })
+                
+                st.dataframe(quantile_df, use_container_width=True)
+                
+                # 关键发现
+                st.markdown("### 🔍 关键发现")
+                
+                iqr = quantile_values[0.75] - quantile_values[0.25]
+                lower_bound = quantile_values[0.25] - 1.5 * iqr
+                upper_bound = quantile_values[0.75] + 1.5 * iqr
+                
+                outlier_count = ((daily_spread < lower_bound) | (daily_spread > upper_bound)).sum()
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.success(f" **中位数价差：** {quantile_values[0.50]:.4f} 元/kWh")
+                    st.info(f" **75%的天数价差低于：** {quantile_values[0.75]:.4f} 元/kWh")
+                with col2:
+                    st.warning(f" **异常值天数：** {outlier_count} 天（占总天数的 {outlier_count/len(daily_spread)*100:.1f}%）")
+                    st.markdown(f"- **正常价差范围：** {lower_bound:.4f} ~ {upper_bound:.4f} 元/kWh")
+            
+            with tab2:
+                st.markdown("### 📊 工作日 vs 周末价差对比")
+                
+                # 按工作日/周末分组统计
+                weekday_stats = df_price_spread.groupby('是否周末').agg({
+                    '日电价差': ['mean', 'std', 'min', 'max', 'count']
+                }).round(4)
+                weekday_stats.columns = ['平均价差', '价差标准差', '最小价差', '最大价差', '天数']
+                weekday_stats = weekday_stats.reset_index()
+                
+                # 显示统计表格
+                st.dataframe(weekday_stats, use_container_width=True)
+                
+                # 绘制对比图
+                fig_weekday = go.Figure()
+                
+                fig_weekday.add_trace(go.Bar(
+                    x=weekday_stats['是否周末'],
+                    y=weekday_stats['平均价差'],
+                    name='平均价差',
+                    marker_color=['#2196F3', '#FF6B35'],
+                    text=weekday_stats['平均价差'].round(4),
+                    textposition='auto'
+                ))
+                
+                fig_weekday.update_layout(
+                    title='工作日与周末平均价差对比',
+                    xaxis_title='日期类型',
+                    yaxis_title='平均价差 (元/kWh)',
+                    template='plotly_white',
+                    height=400
+                )
+                
+                st.plotly_chart(fig_weekday, use_container_width=True)
+            
+            with tab3:
+                st.markdown("### 📊 月度价差趋势")
+                
+                # 按月份统计价差
+                monthly_spread = df_price_spread.groupby('月份').agg({
+                    '日电价差': ['mean', 'std', 'min', 'max', 'count']
+                }).round(4)
+                monthly_spread.columns = ['平均价差', '价差标准差', '最小价差', '最大价差', '天数']
+                monthly_spread = monthly_spread.reset_index()
+                
+                # 显示统计表格
+                st.dataframe(monthly_spread, use_container_width=True)
+                
+                # 绘制月度趋势图
+                fig_monthly = go.Figure()
+                
+                fig_monthly.add_trace(go.Scatter(
+                    x=monthly_spread['月份'],
+                    y=monthly_spread['平均价差'],
+                    mode='lines+markers',
+                    name='平均价差',
+                    line=dict(color='#FF6B35', width=2),
+                    marker=dict(size=8)
+                ))
+                
+                # 添加误差线（标准差）
+                fig_monthly.add_trace(go.Scatter(
+                    x=monthly_spread['月份'],
+                    y=monthly_spread['平均价差'] + monthly_spread['价差标准差'],
+                    mode='lines',
+                    name='+标准差',
+                    line=dict(color='rgba(255, 107, 53, 0.3)', width=1, dash='dash'),
+                    showlegend=False
+                ))
+                
+                fig_monthly.add_trace(go.Scatter(
+                    x=monthly_spread['月份'],
+                    y=monthly_spread['平均价差'] - monthly_spread['价差标准差'],
+                    mode='lines',
+                    name='-标准差',
+                    line=dict(color='rgba(255, 107, 53, 0.3)', width=1, dash='dash'),
+                    fill='tonexty',
+                    fillcolor='rgba(255, 107, 53, 0.1)',
+                    showlegend=False
+                ))
+                
+                fig_monthly.update_layout(
+                    title='月度平均价差趋势',
+                    xaxis_title='月份',
+                    yaxis_title='平均价差 (元/kWh)',
+                    template='plotly_white',
+                    height=400,
+                    xaxis=dict(tickmode='linear', dtick=1)
+                )
+                
+                st.plotly_chart(fig_monthly, use_container_width=True)
+            
+            with tab4:
+                st.markdown("### 📊 季度价差对比")
+                
+                # 按季度统计价差
+                quarterly_spread = df_price_spread.groupby('季度').agg({
+                    '日电价差': ['mean', 'std', 'min', 'max', 'count']
+                }).round(4)
+                quarterly_spread.columns = ['平均价差', '价差标准差', '最小价差', '最大价差', '天数']
+                quarterly_spread = quarterly_spread.reset_index()
+                quarterly_spread['季度名称'] = quarterly_spread['季度'].apply(lambda x: f'Q{x}')
+                
+                # 显示统计表格
+                st.dataframe(quarterly_spread[['季度名称', '平均价差', '价差标准差', '最小价差', '最大价差', '天数']], use_container_width=True)
+                
+                # 绘制季度对比图
+                fig_quarterly = go.Figure()
+                
+                fig_quarterly.add_trace(go.Bar(
+                    x=quarterly_spread['季度名称'],
+                    y=quarterly_spread['平均价差'],
+                    name='平均价差',
+                    marker_color=['#FF6B35', '#2196F3', '#4CAF50', '#9C27B0'],
+                    text=quarterly_spread['平均价差'].round(4),
+                    textposition='auto'
+                ))
+                
+                fig_quarterly.update_layout(
+                    title='季度平均价差对比',
+                    xaxis_title='季度',
+                    yaxis_title='平均价差 (元/kWh)',
+                    template='plotly_white',
+                    height=400
+                )
+                
+                st.plotly_chart(fig_quarterly, use_container_width=True)
+        
+        st.divider()
+
+        # 时段特征及波动趋势分析
+        if pd.api.types.is_datetime64_any_dtype(df[date_col]):
+            st.subheader("⚡ 时段特征及波动趋势")
+            
+            # 为每个时间节点添加时段类型标签
+            df_time_features = df.copy()
+            df_time_features['日期'] = df_time_features[date_col]
+            
+            # 计算每个时间节点的统计特征
+            time_stats_list = []
+            for time_col in time_columns:
+                time_data = df_time_features[time_col].dropna()
+                time_stats = {
+                    '时间节点': time_col,
+                    '平均电价': time_data.mean(),
+                    '电价中位数': time_data.median(),
+                    '电价标准差': time_data.std(),
+                    '电价变异系数': time_data.std() / time_data.mean() if time_data.mean() != 0 else 0,
+                    '最高电价': time_data.max(),
+                    '最低电价': time_data.min(),
+                    '电价极差': time_data.max() - time_data.min(),
+                    '数据天数': len(time_data)
+                }
+                time_stats_list.append(time_stats)
+            
+            time_stats_df = pd.DataFrame(time_stats_list).round(4)
+            
+            # 添加时段类型
+            # 假设第一个日期来判定时段类型
+            sample_date = df_time_features[date_col].iloc[0]
+            time_stats_df['时段类型'] = time_stats_df['时间节点'].apply(
+                lambda t: get_guangdong_period_type(sample_date, t)
+            )
+            
+            # 创建Tabs
+            tab1, tab2, tab3 = st.tabs(["峰平谷时段特征", "电价波动趋势", "波动特征统计"])
+            
+            with tab1:
+                st.markdown("###  峰、平、谷时段电价特征")
+                
+                # 按时段类型分组统计
+                period_stats = time_stats_df.groupby('时段类型').agg({
+                    '平均电价': 'mean',
+                    '电价标准差': 'mean',
+                    '电价变异系数': 'mean',
+                    '最高电价': 'max',
+                    '最低电价': 'min',
+                    '电价极差': 'mean'
+                }).round(4).reset_index()
+                
+                # 显示统计表格
+                st.dataframe(period_stats, use_container_width=True)
+                
+                # 绘制峰平谷对比图
+                fig_period = go.Figure()
+                
+                # 按顺序排列时段类型
+                period_order = ['尖峰', '峰', '平', '谷', '深谷']
+                period_stats['排序'] = period_stats['时段类型'].apply(
+                    lambda x: period_order.index(x) if x in period_order else len(period_order)
+                )
+                period_stats = period_stats.sort_values('排序')
+                
+                colors = {'尖峰': '#FF0000', '峰': '#FF6B35', '平': '#FFC107', '谷': '#2196F3', '深谷': '#4CAF50'}
+                
+                fig_period.add_trace(go.Bar(
+                    x=period_stats['时段类型'],
+                    y=period_stats['平均电价'],
+                    name='平均电价',
+                    marker_color=[colors.get(p, '#999999') for p in period_stats['时段类型']],
+                    text=period_stats['平均电价'].round(4),
+                    textposition='auto'
+                ))
+                
+                fig_period.update_layout(
+                    title='各时段类型平均电价对比',
+                    xaxis_title='时段类型',
+                    yaxis_title='平均电价 (元/kWh)',
+                    template='plotly_white',
+                    height=400
+                )
+                
+                st.plotly_chart(fig_period, use_container_width=True)
+                
+                # 显示关键发现
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    max_period = period_stats.loc[period_stats['平均电价'].idxmax()]
+                    st.success(f" **最高均价时段：** {max_period['时段类型']} ({max_period['平均电价']:.4f} 元/kWh)")
+                with col2:
+                    min_period = period_stats.loc[period_stats['平均电价'].idxmin()]
+                    st.info(f"🟢 **最低均价时段：** {min_period['时段类型']} ({min_period['平均电价']:.4f} 元/kWh)")
+                with col3:
+                    max_spread_period = period_stats.loc[period_stats['电价极差'].idxmax()]
+                    st.warning(f"🟡 **波动最大时段：** {max_spread_period['时段类型']} (极差：{max_spread_period['电价极差']:.4f})")
+            
+            with tab2:
+                st.markdown("### 📊 各时间节点电价波动趋势")
+                
+                # 绘制每个时间节点的均价和标准差
+                fig_trend = go.Figure()
+                
+                # 均价曲线
+                fig_trend.add_trace(go.Scatter(
+                    x=time_stats_df['时间节点'],
+                    y=time_stats_df['平均电价'],
+                    mode='lines+markers',
+                    name='平均电价',
+                    line=dict(color='#FF6B35', width=2),
+                    marker=dict(size=6)
+                ))
+                
+                # 标准差带
+                fig_trend.add_trace(go.Scatter(
+                    x=time_stats_df['时间节点'],
+                    y=time_stats_df['平均电价'] + time_stats_df['电价标准差'],
+                    mode='lines',
+                    name='+标准差',
+                    line=dict(color='rgba(255, 107, 53, 0.3)', width=1, dash='dash'),
+                    showlegend=False
+                ))
+                
+                fig_trend.add_trace(go.Scatter(
+                    x=time_stats_df['时间节点'],
+                    y=time_stats_df['平均电价'] - time_stats_df['电价标准差'],
+                    mode='lines',
+                    name='-标准差',
+                    line=dict(color='rgba(255, 107, 53, 0.3)', width=1, dash='dash'),
+                    fill='tonexty',
+                    fillcolor='rgba(255, 107, 53, 0.1)',
+                    showlegend=False
+                ))
+                
+                fig_trend.update_layout(
+                    title='各时间节点平均电价及波动范围',
+                    xaxis_title='时间节点',
+                    yaxis_title='电价 (元/kWh)',
+                    template='plotly_white',
+                    height=400,
+                    xaxis=dict(
+                        tickangle=45,
+                        tickvals=time_columns[::4],
+                        ticktext=[time_columns[i] for i in range(0, len(time_columns), 4)]
+                    )
+                )
+                
+                st.plotly_chart(fig_trend, use_container_width=True)
+                
+                # 变异系数趋势图
+                fig_cv = go.Figure()
+                
+                fig_cv.add_trace(go.Scatter(
+                    x=time_stats_df['时间节点'],
+                    y=time_stats_df['电价变异系数'],
+                    mode='lines+markers',
+                    name='变异系数',
+                    line=dict(color='#2196F3', width=2),
+                    marker=dict(size=6)
+                ))
+                
+                fig_cv.update_layout(
+                    title='各时间节点电价变异系数（相对波动程度）',
+                    xaxis_title='时间节点',
+                    yaxis_title='变异系数',
+                    template='plotly_white',
+                    height=400,
+                    xaxis=dict(
+                        tickangle=45,
+                        tickvals=time_columns[::4],
+                        ticktext=[time_columns[i] for i in range(0, len(time_columns), 4)]
+                    )
+                )
+                
+                st.plotly_chart(fig_cv, use_container_width=True)
+            
+            with tab3:
+                st.markdown("###  波动特征统计")
+                
+                # 显示详细的时间节点统计数据
+                st.dataframe(time_stats_df, use_container_width=True, height=400)
+                
+                # 找出波动最大和最小的时间段
+                col1, col2 = st.columns(2)
+                with col1:
+                    max_std_row = time_stats_df.loc[time_stats_df['电价标准差'].idxmax()]
+                    st.warning(f" **波动最大的时间节点：** {max_std_row['时间节点']}")
+                    st.markdown(f"- 平均电价：{max_std_row['平均电价']:.4f} 元/kWh")
+                    st.markdown(f"- 标准差：{max_std_row['电价标准差']:.4f}")
+                    st.markdown(f"- 变异系数：{max_std_row['电价变异系数']:.4f}")
+                    st.markdown(f"- 极差：{max_std_row['电价极差']:.4f}")
+                
+                with col2:
+                    min_std_row = time_stats_df.loc[time_stats_df['电价标准差'].idxmin()]
+                    st.success(f" **波动最小的时间节点：** {min_std_row['时间节点']}")
+                    st.markdown(f"- 平均电价：{min_std_row['平均电价']:.4f} 元/kWh")
+                    st.markdown(f"- 标准差：{min_std_row['电价标准差']:.4f}")
+                    st.markdown(f"- 变异系数：{min_std_row['电价变异系数']:.4f}")
+                    st.markdown(f"- 极差：{min_std_row['电价极差']:.4f}")
+        
+        st.divider()
+
         # 年度统计
-        st.subheader("📊 年度统计分析")
+        st.subheader(" 年度统计分析")
 
         # 计算每天的平均电价
         daily_avg_prices = df[price_cols].mean(axis=1)
@@ -1402,22 +2453,59 @@ def main():
                 ]['电站名'].astype(str).str.strip().tolist()
                 filtered_price_files = {k: v for k, v in price_files.items() if k in city_stations}
         
-        price_file_index = build_price_file_index(filtered_price_files)
-        st.caption("排名结果会自动缓存到本地，应用重启后也能复用；只有变更过的 Excel 才会重算。")
+        # 根据数据源选择计算方式
+        data_source = st.session_state.get('data_source', 'excel')
         
-        if selected_city_filter:
-            st.caption(f"🌍 当前筛选城市：{selected_city_filter}")
+        if data_source == 'database':
+            # 数据库模式
+            selected_year = st.session_state.get('selected_year')
+            station_year_pairs = [(station, selected_year) for station in filtered_price_files.keys()]
+            st.caption("从数据库计算电价差排名。")
+            
+            if selected_city_filter:
+                st.caption(f"🌍 当前筛选城市：{selected_city_filter}")
 
-        with st.spinner("正在计算所有站点电价差..."):
-            all_stations_stats, failed_stations, cache_summary = calculate_all_stations_price_spread(price_file_index)
+            with st.spinner("正在计算所有站点电价差..."):
+                all_stations_stats, failed_stations, cache_summary = calculate_all_stations_price_spread_from_db(station_year_pairs)
 
-        st.caption(
-            f"本次命中本地缓存 {cache_summary['cached_count']} 个文件，"
-            f"重新计算 {cache_summary['recomputed_count']} 个文件。"
-        )
+            st.caption(
+                f"本次从数据库计算 {cache_summary['recomputed_count']} 个站点。"
+            )
+            
+            # 显示失败站点提示和重新加载按钮
+            if failed_stations:
+                st.warning(f"有 {len(failed_stations)} 个站点统计失败，已自动跳过: {', '.join([s[0] if isinstance(s, tuple) else s for s in failed_stations[:5]])}{'...' if len(failed_stations) > 5 else ''}")
+                
+                col_reload, col_info = st.columns([1, 3])
+                with col_reload:
+                    if st.button("🔄 重新加载失败站点", key="reload_failed_rankings"):
+                        # 清除相关缓存
+                        calculate_all_stations_price_spread_from_db.clear()
+                        for station_info in failed_stations:
+                            station_name = station_info[0] if isinstance(station_info, tuple) else station_info
+                            load_price_data_from_db.clear(station_name, selected_year)
+                        st.rerun()
+                with col_info:
+                    st.info("点击按钮重新加载失败的站点数据")
+        else:
+            # Excel模式
+            price_file_index = build_price_file_index(filtered_price_files)
+            st.caption("排名结果会自动缓存到本地，应用重启后也能复用；只有变更过的 Excel 才会重算。")
+            
+            if selected_city_filter:
+                st.caption(f"🌍 当前筛选城市：{selected_city_filter}")
 
-        if failed_stations:
-            st.warning(f"有 {len(failed_stations)} 个站点文件统计失败，已自动跳过。")
+            with st.spinner("正在计算所有站点电价差..."):
+                all_stations_stats, failed_stations, cache_summary = calculate_all_stations_price_spread(price_file_index)
+
+            st.caption(
+                f"本次命中本地缓存 {cache_summary['cached_count']} 个文件，"
+                f"重新计算 {cache_summary['recomputed_count']} 个文件。"
+            )
+            
+            # Excel模式下显示失败站点提示
+            if failed_stations:
+                st.warning(f"有 {len(failed_stations)} 个站点文件统计失败，已自动跳过。")
 
         if len(all_stations_stats) > 0:
             # 为所有统计数据添加厂站类型信息
@@ -1796,7 +2884,14 @@ def main():
         if "opt_results" not in st.session_state:
             st.session_state.opt_results = None
 
-        cache_key = (str(price_files.get(selected_station, '')), P, battery_capacity, efficiency)
+        # 根据数据源生成缓存键
+        data_source = st.session_state.get('data_source', 'excel')
+        if data_source == 'database':
+            selected_year = st.session_state.get('selected_year')
+            cache_key = (f"db_{selected_station}_{selected_year}", P, battery_capacity, efficiency)
+        else:
+            cache_key = (str(price_files.get(selected_station, '')), P, battery_capacity, efficiency)
+        
         params_changed = (st.session_state.opt_cache_key != cache_key)
 
         # 开始优化按钮
@@ -1805,9 +2900,18 @@ def main():
         if run_opt:
             with st.spinner("正在加载电价数据并优化..."):
                 try:
-                    date_list, all_results, all_summaries = run_optimization_cached(
-                        price_files[selected_station], P, battery_capacity, efficiency
-                    )
+                    if data_source == 'database':
+                        # 数据库模式
+                        selected_year = st.session_state.get('selected_year')
+                        date_list, all_results, all_summaries = run_optimization_cached_from_db(
+                            selected_station, selected_year, P, battery_capacity, efficiency
+                        )
+                    else:
+                        # Excel模式
+                        date_list, all_results, all_summaries = run_optimization_cached(
+                            price_files[selected_station], P, battery_capacity, efficiency
+                        )
+                    
                     st.session_state.opt_results = {
                         'date_list': date_list,
                         'all_results': all_results,
