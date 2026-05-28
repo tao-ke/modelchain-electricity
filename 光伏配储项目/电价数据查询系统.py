@@ -39,7 +39,7 @@ CACHE_DIR = SCRIPT_DIR / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
 RANKING_CACHE_FILE = CACHE_DIR / ".price_spread_rank_cache.pkl"
 PROVINCIAL_AVG_CACHE_FILE = CACHE_DIR / ".provincial_avg_cache.pkl"
-RANKING_CACHE_VERSION = 1
+RANKING_CACHE_VERSION = 2
 PROVINCIAL_AVG_CACHE_VERSION = 2
 FACTORY_GROUP_COLUMN = "厂站类型"
 FACTORY_STATION_LABEL = "电厂"
@@ -57,9 +57,9 @@ DB_CONFIG = {
 
 # 储能优化参数配置
 STORAGE_CONFIG = {
-    'P': 250000,  # 储能逆变器功率，单位 kW
-    'battery_capacity': 500000,  # 电池容量上限，单位 kWh
-    'initial_soc': 0,  # 初始电量，单位 kWh
+    'P': 250,  # 储能逆变器功率，单位 MW
+    'battery_capacity': 500,  # 电池容量上限，单位 MWh
+    'initial_soc': 0,  # 初始电量，单位 MWh
     'efficiency': 0.85,  # 放电效率
     'dt': 0.25,  # 时间间隔，小时
     'num': 96  # 每天时段数
@@ -110,6 +110,7 @@ def get_db_connection():
         return None
 
 
+@st.cache_data(ttl=300, show_spinner=False)  # 缓存5分钟
 def check_db_available():
     """检测数据库是否可用，返回(True, None)或(False, 错误信息)"""
     try:
@@ -120,7 +121,7 @@ def check_db_available():
         return False, str(e)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)  # 缓存5分钟
 def get_db_station_list():
     """从数据库获取所有站点列表"""
     conn = get_db_connection()
@@ -142,7 +143,7 @@ def get_db_station_list():
         conn.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)  # 缓存5分钟
 def get_db_available_years():
     """从数据库获取可用的年份列表"""
     conn = get_db_connection()
@@ -164,7 +165,7 @@ def get_db_available_years():
         conn.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)  # 缓存10分钟
 def load_price_data_from_db(station_name, year):
     """从数据库加载指定站点和年份的电价数据
     
@@ -303,15 +304,19 @@ def _calculate_station_stats_from_db(station_name, year):
     if price_data.empty:
         return None
     
-    daily_max = price_data.max(axis=1)
-    daily_min = price_data.min(axis=1)
-    daily_spread = daily_max - daily_min
+    # 计算日均峰谷价差（每日最高8个时段均价 - 每日最低8个时段均价）
+    n_peak = 8  # 取最高的8个时段
+    
+    daily_peak_avg = price_data.apply(lambda row: row.nlargest(n_peak).mean(), axis=1)
+    daily_valley_avg = price_data.apply(lambda row: row.nsmallest(n_peak).mean(), axis=1)
+    daily_spread = daily_peak_avg - daily_valley_avg
+    
     all_prices = price_data.to_numpy().flatten()
     
     return {
-        '日均电价差': round(daily_spread.mean(), 4),
-        '全年最高电价差': round(daily_spread.max(), 4),
-        '全年最低电价差': round(daily_spread.min(), 4),
+        '日均峰谷价差': round(daily_spread.mean(), 4),
+        '全年最高峰谷价差': round(daily_spread.max(), 4),
+        '全年最低峰谷价差': round(daily_spread.min(), 4),
         '全年平均电价': round(all_prices.mean(), 4),
         '数据天数': len(df)
     }
@@ -354,9 +359,9 @@ def calculate_all_stations_price_spread_from_db(station_year_pairs):
         }
     
     stats_df = pd.DataFrame(station_stats)
-    stats_df = stats_df.sort_values('日均电价差', ascending=False).reset_index(drop=True)
+    stats_df = stats_df.sort_values('日均峰谷价差', ascending=False).reset_index(drop=True)
     stats_df['排名'] = range(1, len(stats_df) + 1)
-    stats_df = stats_df[['排名', '站点名称', '日均电价差', '全年最高电价差', '全年最低电价差', '全年平均电价', '数据天数']]
+    stats_df = stats_df[['排名', '站点名称', '日均峰谷价差', '全年最高峰谷价差', '全年最低峰谷价差', '全年平均电价', '数据天数']]
     
     return stats_df, tuple(failed_stations), {
         "cached_count": 0,
@@ -751,6 +756,7 @@ def _calculate_station_stats_with_openpyxl(file_path_str):
         rows = worksheet.iter_rows(values_only=True)
         next(rows, None)  # 跳过表头
 
+        n_peak = 8  # 取最高的8个时段
         spread_sum = 0.0
         spread_max = None
         spread_min = None
@@ -759,8 +765,8 @@ def _calculate_station_stats_with_openpyxl(file_path_str):
         total_price_count = 0
 
         for row in rows:
-            row_min = None
-            row_max = None
+            # 收集该行所有电价数值
+            row_prices = []
             row_sum = 0.0
             row_count = 0
 
@@ -768,16 +774,19 @@ def _calculate_station_stats_with_openpyxl(file_path_str):
                 numeric_value = _coerce_numeric(cell_value)
                 if numeric_value is None:
                     continue
-
+                row_prices.append(numeric_value)
                 row_sum += numeric_value
                 row_count += 1
-                row_min = numeric_value if row_min is None else min(row_min, numeric_value)
-                row_max = numeric_value if row_max is None else max(row_max, numeric_value)
 
-            if row_count == 0:
+            if row_count < n_peak * 2:
                 continue
 
-            daily_spread = row_max - row_min
+            # 排序后取最高8个和最低8个的平均值
+            sorted_prices = sorted(row_prices)
+            valley_avg = sum(sorted_prices[:n_peak]) / n_peak
+            peak_avg = sum(sorted_prices[-n_peak:]) / n_peak
+            daily_spread = peak_avg - valley_avg
+
             spread_sum += daily_spread
             spread_max = daily_spread if spread_max is None else max(spread_max, daily_spread)
             spread_min = daily_spread if spread_min is None else min(spread_min, daily_spread)
@@ -789,9 +798,9 @@ def _calculate_station_stats_with_openpyxl(file_path_str):
             return None
 
         return {
-            '日均电价差': round(spread_sum / day_count, 4),
-            '全年最高电价差': round(spread_max, 4),
-            '全年最低电价差': round(spread_min, 4),
+            '日均峰谷价差': round(spread_sum / day_count, 4),
+            '全年最高峰谷价差': round(spread_max, 4),
+            '全年最低峰谷价差': round(spread_min, 4),
             '全年平均电价': round(total_price_sum / total_price_count, 4),
             '数据天数': day_count
         }
@@ -808,15 +817,19 @@ def _calculate_station_stats_with_pandas(file_path_str):
     if price_data.empty:
         return None
 
-    daily_max = price_data.max(axis=1)
-    daily_min = price_data.min(axis=1)
-    daily_spread = daily_max - daily_min
+    # 计算日均峰谷价差（每日最高8个时段均价 - 每日最低8个时段均价）
+    n_peak = 8  # 取最高的8个时段
+    
+    daily_peak_avg = price_data.apply(lambda row: row.nlargest(n_peak).mean(), axis=1)
+    daily_valley_avg = price_data.apply(lambda row: row.nsmallest(n_peak).mean(), axis=1)
+    daily_spread = daily_peak_avg - daily_valley_avg
+    
     all_prices = price_data.to_numpy().flatten()
 
     return {
-        '日均电价差': round(daily_spread.mean(), 4),
-        '全年最高电价差': round(daily_spread.max(), 4),
-        '全年最低电价差': round(daily_spread.min(), 4),
+        '日均峰谷价差': round(daily_spread.mean(), 4),
+        '全年最高峰谷价差': round(daily_spread.max(), 4),
+        '全年最低峰谷价差': round(daily_spread.min(), 4),
         '全年平均电价': round(all_prices.mean(), 4),
         '数据天数': len(df)
     }
@@ -898,9 +911,9 @@ def calculate_all_stations_price_spread(price_file_index):
             "modified_time_ns": modified_time_ns,
             "file_size": file_size,
             "stats": {
-                "日均电价差": result["日均电价差"],
-                "全年最高电价差": result["全年最高电价差"],
-                "全年最低电价差": result["全年最低电价差"],
+                "日均峰谷价差": result["日均峰谷价差"],
+                "全年最高峰谷价差": result["全年最高峰谷价差"],
+                "全年最低峰谷价差": result["全年最低峰谷价差"],
                 "全年平均电价": result["全年平均电价"],
                 "数据天数": result["数据天数"]
             }
@@ -922,9 +935,9 @@ def calculate_all_stations_price_spread(price_file_index):
         save_ranking_cache_entries(merged_cache_entries)
 
     stats_df = pd.DataFrame(station_stats)
-    stats_df = stats_df.sort_values('日均电价差', ascending=False).reset_index(drop=True)
+    stats_df = stats_df.sort_values('日均峰谷价差', ascending=False).reset_index(drop=True)
     stats_df['排名'] = range(1, len(stats_df) + 1)
-    stats_df = stats_df[['排名', '站点名称', '日均电价差', '全年最高电价差', '全年最低电价差', '全年平均电价', '数据天数']]
+    stats_df = stats_df[['排名', '站点名称', '日均峰谷价差', '全年最高峰谷价差', '全年最低峰谷价差', '全年平均电价', '数据天数']]
     return stats_df, tuple(failed_stations), {
         "cached_count": cached_count,
         "recomputed_count": len(pending_file_index)
@@ -1069,7 +1082,7 @@ def prepare_grouped_rankings(all_stations_stats, station_info_df, group_column):
 
     grouped_df[group_column] = grouped_df[group_column].fillna('未分组')
     grouped_df = grouped_df.sort_values(
-        [group_column, '日均电价差', '站点名称'],
+        [group_column, '日均峰谷价差', '站点名称'],
         ascending=[True, False, True]
     ).reset_index(drop=True)
     grouped_df['组内排名'] = grouped_df.groupby(group_column).cumcount() + 1
@@ -1163,9 +1176,19 @@ def optimize_single_day(price, day_index, start_soc, config):
 
 @st.cache_data(show_spinner="正在优化储能调度...")
 def run_optimization_cached(file_path_or_none, P, battery_capacity, efficiency):
-    """缓存化的多天储能优化，相同参数+相同文件只计算一次"""
+    """缓存化的多天储能优化，相同参数+相同文件只计算一次
+    
+    Args:
+        P: 逆变器功率 (MW)
+        battery_capacity: 电池容量 (MWh)
+        efficiency: 放电效率
+    """
+    # 将MW/MWh转换为kW/kWh进行内部计算
+    P_kw = P * 1000  # MW -> kW
+    battery_capacity_kwh = battery_capacity * 1000  # MWh -> kWh
+    
     config = {
-        'P': P, 'battery_capacity': battery_capacity,
+        'P': P_kw, 'battery_capacity': battery_capacity_kwh,
         'initial_soc': 0, 'efficiency': efficiency,
         'dt': 0.25, 'num': 96
     }
@@ -1242,9 +1265,21 @@ def run_optimization_cached(file_path_or_none, P, battery_capacity, efficiency):
 
 @st.cache_data(show_spinner="正在优化储能调度...")
 def run_optimization_cached_from_db(station_name, year, P, battery_capacity, efficiency):
-    """从数据库加载数据并进行储能优化"""
+    """从数据库加载数据并进行储能优化
+    
+    Args:
+        station_name: 站点名称
+        year: 年份
+        P: 逆变器功率 (MW)
+        battery_capacity: 电池容量 (MWh)
+        efficiency: 放电效率
+    """
+    # 将MW/MWh转换为kW/kWh进行内部计算
+    P_kw = P * 1000  # MW -> kW
+    battery_capacity_kwh = battery_capacity * 1000  # MWh -> kWh
+    
     config = {
-        'P': P, 'battery_capacity': battery_capacity,
+        'P': P_kw, 'battery_capacity': battery_capacity_kwh,
         'initial_soc': 0, 'efficiency': efficiency,
         'dt': 0.25, 'num': 96
     }
@@ -1334,7 +1369,7 @@ def main():
     data_source = st.sidebar.radio(
         "选择数据源",
         options=["数据库", "Excel文件"],
-        index=0,
+        index=1,  # 默认为Excel文件模式
         help="选择从数据库或Excel文件读取电价数据"
     )
 
@@ -1816,32 +1851,34 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
         
         with metrics_col:
-            # 计算并显示站点电价与全省平均电价的标准差之和
+            # 计算并显示站点电价与全省平均电价的RMSE
             if prov_avg is not None and prov_dates is not None:
                 prov_date_to_row = {d: i for i, d in enumerate(prov_dates)}
                 if selected_date in prov_date_to_row:
                     prov_prices = prov_avg[prov_date_to_row[selected_date]]
                     
-                    # 计算每个时间节点的标准差
-                    price_diff = np.abs(prices - prov_prices)
-                    std_sum = np.sum(price_diff)
+                    # 计算RMSE（均方根误差）
+                    price_diff = prices - prov_prices
+                    rmse = np.sqrt(np.mean(price_diff ** 2))
                     
                     st.subheader("📊 电价差异分析")
                     st.divider()
                     
                     st.metric(
-                        "标准差之和",
-                        f"{std_sum:.4f}",
-                        help="站点电价与全省平均电价在每个时间节点的绝对差值之和"
+                        "RMSE (均方根误差)",
+                        f"{rmse:.4f}",
+                        help="站点电价与全省平均电价的均方根误差，越小表示越接近全省均价"
                     )
                     
+                    # 计算其他统计指标
+                    mae = np.mean(np.abs(price_diff))
                     st.metric(
-                        "平均标准差",
-                        f"{std_sum / len(prices):.4f}",
-                        help="标准差之和的平均值"
+                        "MAE (平均绝对误差)",
+                        f"{mae:.4f}",
+                        help="站点电价与全省平均电价的平均绝对误差"
                     )
                     
-                    max_diff_idx = np.argmax(price_diff)
+                    max_diff_idx = np.argmax(np.abs(price_diff))
                     st.metric(
                         "最大差异节点",
                         time_columns[max_diff_idx],
@@ -1860,12 +1897,23 @@ def main():
         if pd.api.types.is_datetime64_any_dtype(df[date_col]):
             st.subheader("🔍 价差规律分析")
             
-            # 计算每日价差
+            # 用户选择峰谷时段数
+            n_peak = st.slider(
+                "选择峰谷时段数",
+                min_value=1,
+                max_value=24,
+                value=8,
+                help="取电价最高N个时段和最低N个时段的平均值之差作为日均峰谷价差"
+            )
+            
+            # 计算日均峰谷价差
             df_price_spread = df.copy()
             df_price_spread['日期'] = df_price_spread[date_col]
-            df_price_spread['日最高电价'] = df_price_spread[price_cols].max(axis=1)
-            df_price_spread['日最低电价'] = df_price_spread[price_cols].min(axis=1)
-            df_price_spread['日电价差'] = df_price_spread['日最高电价'] - df_price_spread['日最低电价']
+            
+            # 计算每日最高N个时段均价和最低N个时段均价
+            df_price_spread['峰值均价'] = df_price_spread[price_cols].apply(lambda row: row.nlargest(n_peak).mean(), axis=1)
+            df_price_spread['谷值均价'] = df_price_spread[price_cols].apply(lambda row: row.nsmallest(n_peak).mean(), axis=1)
+            df_price_spread['日均峰谷价差'] = df_price_spread['峰值均价'] - df_price_spread['谷值均价']
             df_price_spread['日均电价'] = df_price_spread[price_cols].mean(axis=1)
             df_price_spread['月份'] = df_price_spread['日期'].dt.month
             df_price_spread['季度'] = df_price_spread['日期'].dt.quarter
@@ -1876,30 +1924,30 @@ def main():
             tab1, tab2, tab3, tab4 = st.tabs(["日内价差规律", "工作日/周末对比", "月度价差趋势", "季度价差对比"])
             
             with tab1:
-                st.markdown("### 📊 日内电价差分布分析")
-                st.info("💡 **日内电价差** = 每日最高电价 - 每日最低电价，反映每天电价的最大波动幅度")
+                st.markdown(f"### 📊 日均峰谷价差分布分析（取{n_peak}个时段）")
+                st.info(f"💡 **日均峰谷价差** = 每日电价最高的{n_peak}个时段均价 - 每日电价最低的{n_peak}个时段均价")
                 
-                # 获取日电价差数据
-                daily_spread = df_price_spread['日电价差']
+                # 获取日均峰谷价差数据
+                daily_spread = df_price_spread['日均峰谷价差']
                 
                 # 统计信息
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("平均日电价差", f"{daily_spread.mean():.4f} 元/kWh")
+                    st.metric("平均日均峰谷价差", f"{daily_spread.mean():.4f} 元/kWh")
                 with col2:
-                    st.metric("最大日电价差", f"{daily_spread.max():.4f} 元/kWh")
+                    st.metric("最大日均峰谷价差", f"{daily_spread.max():.4f} 元/kWh")
                 with col3:
-                    st.metric("最小日电价差", f"{daily_spread.min():.4f} 元/kWh")
+                    st.metric("最小日均峰谷价差", f"{daily_spread.min():.4f} 元/kWh")
                 with col4:
                     st.metric("价差标准差", f"{daily_spread.std():.4f}")
                 
-                # 绘制日电价差分布直方图
+                # 绘制日均峰谷价差分布直方图
                 fig_hist = go.Figure()
                 
                 fig_hist.add_trace(go.Histogram(
                     x=daily_spread,
                     nbinsx=50,
-                    name='日电价差分布',
+                    name='日均峰谷价差分布',
                     marker_color='#FF6B35',
                     opacity=0.7
                 ))
@@ -1914,8 +1962,8 @@ def main():
                 )
                 
                 fig_hist.update_layout(
-                    title='日电价差分布直方图',
-                    xaxis_title='日电价差 (元/kWh)',
+                    title='日均峰谷价差分布直方图',
+                    xaxis_title='日均峰谷价差 (元/kWh)',
                     yaxis_title='天数',
                     template='plotly_white',
                     height=400
@@ -1924,21 +1972,21 @@ def main():
                 st.plotly_chart(fig_hist, use_container_width=True)
                 
                 # 绘制箱线图
-                st.markdown("### 📦 日电价差箱线图")
+                st.markdown("### 📦 日均峰谷价差箱线图")
                 
                 fig_box = go.Figure()
                 
                 fig_box.add_trace(go.Box(
                     y=daily_spread,
-                    name='日电价差',
+                    name='日均峰谷价差',
                     marker_color='#FF6B35',
                     boxmean=True,
                     boxpoints='outliers'
                 ))
                 
                 fig_box.update_layout(
-                    title='日电价差箱线图（显示异常值）',
-                    yaxis_title='日电价差 (元/kWh)',
+                    title='日均峰谷价差箱线图（显示异常值）',
+                    yaxis_title='日均峰谷价差 (元/kWh)',
                     template='plotly_white',
                     height=400
                 )
@@ -1989,7 +2037,7 @@ def main():
                 
                 # 按工作日/周末分组统计
                 weekday_stats = df_price_spread.groupby('是否周末').agg({
-                    '日电价差': ['mean', 'std', 'min', 'max', 'count']
+                    '日均峰谷价差': ['mean', 'std', 'min', 'max', 'count']
                 }).round(4)
                 weekday_stats.columns = ['平均价差', '价差标准差', '最小价差', '最大价差', '天数']
                 weekday_stats = weekday_stats.reset_index()
@@ -2024,7 +2072,7 @@ def main():
                 
                 # 按月份统计价差
                 monthly_spread = df_price_spread.groupby('月份').agg({
-                    '日电价差': ['mean', 'std', 'min', 'max', 'count']
+                    '日均峰谷价差': ['mean', 'std', 'min', 'max', 'count']
                 }).round(4)
                 monthly_spread.columns = ['平均价差', '价差标准差', '最小价差', '最大价差', '天数']
                 monthly_spread = monthly_spread.reset_index()
@@ -2081,7 +2129,7 @@ def main():
                 
                 # 按季度统计价差
                 quarterly_spread = df_price_spread.groupby('季度').agg({
-                    '日电价差': ['mean', 'std', 'min', 'max', 'count']
+                    '日均峰谷价差': ['mean', 'std', 'min', 'max', 'count']
                 }).round(4)
                 quarterly_spread.columns = ['平均价差', '价差标准差', '最小价差', '最大价差', '天数']
                 quarterly_spread = quarterly_spread.reset_index()
@@ -2370,6 +2418,86 @@ def main():
 
         st.plotly_chart(fig_trend, use_container_width=True)
 
+        # 年度电价差异分析指标
+        if prov_avg is not None and prov_dates is not None:
+            st.subheader("📊 年度电价差异分析")
+            
+            # 计算全省日均电价
+            prov_daily_avg = prov_avg.mean(axis=1)
+            prov_date_to_avg = {d: avg for d, avg in zip(prov_dates, prov_daily_avg)}
+            
+            # 匹配日期计算差异
+            station_dates = analysis_df['日期'].tolist()
+            station_daily_avg = analysis_df['日均电价'].values
+            
+            all_diffs = []
+            all_diffs_squared = []
+            for date_str, station_avg in zip(station_dates, station_daily_avg):
+                if date_str in prov_date_to_avg:
+                    prov_avg_val = prov_date_to_avg[date_str]
+                    diff = station_avg - prov_avg_val
+                    all_diffs.append(abs(diff))
+                    all_diffs_squared.append(diff ** 2)
+            
+            if all_diffs:
+                all_diffs = np.array(all_diffs)
+                all_diffs_squared = np.array(all_diffs_squared)
+                
+                # 计算RMSE（均方根误差）
+                rmse = np.sqrt(np.mean(all_diffs_squared))
+                # 计算MAE（平均绝对误差）
+                mae = np.mean(all_diffs)
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric(
+                        "RMSE (均方根误差)",
+                        f"{rmse:.4f}",
+                        help="站点电价与全省平均电价的均方根误差，越小表示越接近全省均价"
+                    )
+                with col2:
+                    st.metric(
+                        "MAE (平均绝对误差)",
+                        f"{mae:.4f}",
+                        help="站点电价与全省平均电价的平均绝对误差"
+                    )
+                with col3:
+                    max_diff = np.max(all_diffs)
+                    st.metric(
+                        "最大日差异",
+                        f"{max_diff:.4f}",
+                        help="全年中站点电价与全省均价差异最大的一天"
+                    )
+                with col4:
+                    min_diff = np.min(all_diffs)
+                    st.metric(
+                        "最小日差异",
+                        f"{min_diff:.4f}",
+                        help="全年中站点电价与全省均价差异最小的一天"
+                    )
+                
+                # 差异分布直方图
+                fig_diff_hist = go.Figure()
+                fig_diff_hist.add_trace(go.Histogram(
+                    x=all_diffs,
+                    nbinsx=50,
+                    name='差异分布',
+                    marker_color='#FF6B35',
+                    opacity=0.7
+                ))
+                fig_diff_hist.add_vline(
+                    x=mae, line_dash="dash", line_color="red",
+                    annotation_text=f"MAE: {mae:.4f}"
+                )
+                fig_diff_hist.update_layout(
+                    title='站点电价与全省均价差异分布',
+                    xaxis_title='绝对差异 (元/kWh)',
+                    yaxis_title='天数',
+                    template='plotly_white',
+                    height=300
+                )
+                st.plotly_chart(fig_diff_hist, use_container_width=True)
+
         # 月度统计
         st.subheader("📅 月度统计摘要")
 
@@ -2560,14 +2688,14 @@ def main():
                     st.metric("总站点数", f"{len(filtered_stats_df)} 个")
                 with col2:
                     max_spread_station = filtered_stats_df.iloc[0]
-                    st.metric("最高电价差", f"{max_spread_station['日均电价差']:.4f} 元/kWh",
+                    st.metric("最高电价差", f"{max_spread_station['日均峰谷价差']:.4f} 元/kWh",
                              delta=max_spread_station['站点名称'])
                 with col3:
                     min_spread_station = filtered_stats_df.iloc[-1]
-                    st.metric("最低电价差", f"{min_spread_station['日均电价差']:.4f} 元/kWh",
+                    st.metric("最低电价差", f"{min_spread_station['日均峰谷价差']:.4f} 元/kWh",
                              delta=min_spread_station['站点名称'], delta_color="inverse")
                 with col4:
-                    avg_spread_all = filtered_stats_df['日均电价差'].mean()
+                    avg_spread_all = filtered_stats_df['日均峰谷价差'].mean()
                     st.metric("平均电价差", f"{avg_spread_all:.4f} 元/kWh")
 
                 table_title = f"📋 {'全部站点' if selected_factory_filter == '全部' else selected_factory_filter}总排名明细表"
@@ -2575,7 +2703,7 @@ def main():
                 chart_source_df = display_df.copy()
                 chart_x_col = '站点名称'
                 chart_title_prefix = "前"
-                chart_title_suffix = "个站点日均电价差对比"
+                chart_title_suffix = "个站点日均峰谷价差对比"
                 chart_x_title = "站点名称"
                 export_file_name = f"站点电价差总排名{'_' + selected_factory_filter if selected_factory_filter != '全部' else ''}.csv"
                 chart_caption = "表格保留全部站点，图表默认只展示前若干名，避免一次性渲染过多柱子影响速度。"
@@ -2618,7 +2746,7 @@ def main():
                     ].copy()
                     # 重新计算组内排名
                     grouped_display_df = grouped_display_df.sort_values(
-                        [group_column, '日均电价差', '站点名称'],
+                        [group_column, '日均峰谷价差', '站点名称'],
                         ascending=[True, False, True]
                     ).reset_index(drop=True)
                     grouped_display_df['组内排名'] = grouped_display_df.groupby(group_column).cumcount() + 1
@@ -2633,7 +2761,7 @@ def main():
                 if selected_rank_group == f"全部{group_column}":
                     champion_df = (
                         grouped_display_df[grouped_display_df['组内排名'] == 1]
-                        .sort_values('日均电价差', ascending=False)
+                        .sort_values('日均峰谷价差', ascending=False)
                         .reset_index(drop=True)
                     )
 
@@ -2644,14 +2772,14 @@ def main():
                         st.metric("总站点数", f"{len(grouped_display_df)} 个")
                     with col3:
                         champion_station = champion_df.iloc[0]
-                        st.metric(f"最强{group_column}第1名", f"{champion_station['日均电价差']:.4f} 元/kWh",
+                        st.metric(f"最强{group_column}第1名", f"{champion_station['日均峰谷价差']:.4f} 元/kWh",
                                  delta=f"{champion_station[group_column]} - {champion_station['站点名称']}")
                     with col4:
-                        st.metric("冠军平均电价差", f"{champion_df['日均电价差'].mean():.4f} 元/kWh")
+                        st.metric("冠军平均电价差", f"{champion_df['日均峰谷价差'].mean():.4f} 元/kWh")
 
                     table_title = f"📋 各{group_column}排名明细表"
                     display_df = grouped_display_df[
-                        [group_column, '组内排名', '总排名', '站点名称', '日均电价差', '全年最高电价差', '全年最低电价差', '全年平均电价', '数据天数']
+                        [group_column, '组内排名', '总排名', '站点名称', '日均峰谷价差', '全年最高峰谷价差', '全年最低峰谷价差', '全年平均电价', '数据天数']
                     ].copy()
                     display_df = display_df.sort_values([group_column, '组内排名']).reset_index(drop=True)
                     display_df = display_df.rename(columns={'组内排名': group_rank_column_label})
@@ -2674,18 +2802,18 @@ def main():
                         st.metric(f"当前{group_column}站点数", f"{len(single_group_df)} 个")
                     with col2:
                         top_station = single_group_df.iloc[0]
-                        st.metric(f"{group_column}第1名", f"{top_station['日均电价差']:.4f} 元/kWh",
+                        st.metric(f"{group_column}第1名", f"{top_station['日均峰谷价差']:.4f} 元/kWh",
                                  delta=top_station['站点名称'])
                     with col3:
                         bottom_station = single_group_df.iloc[-1]
-                        st.metric(f"{group_column}最后1名", f"{bottom_station['日均电价差']:.4f} 元/kWh",
+                        st.metric(f"{group_column}最后1名", f"{bottom_station['日均峰谷价差']:.4f} 元/kWh",
                                  delta=bottom_station['站点名称'], delta_color="inverse")
                     with col4:
-                        st.metric(f"当前{group_column}平均电价差", f"{single_group_df['日均电价差'].mean():.4f} 元/kWh")
+                        st.metric(f"当前{group_column}平均电价差", f"{single_group_df['日均峰谷价差'].mean():.4f} 元/kWh")
 
                     table_title = f"📋 {selected_rank_group} 排名明细表"
                     display_df = single_group_df[
-                        ['组内排名', '总排名', '站点名称', '日均电价差', '全年最高电价差', '全年最低电价差', '全年平均电价', '数据天数']
+                        ['组内排名', '总排名', '站点名称', '日均峰谷价差', '全年最高峰谷价差', '全年最低峰谷价差', '全年平均电价', '数据天数']
                     ].copy()
                     display_df = display_df.rename(columns={'组内排名': group_rank_column_label})
                     chart_source_df = single_group_df.copy()
@@ -2729,16 +2857,16 @@ def main():
                 fig_spread = go.Figure()
                 bar_kwargs = dict(
                     x=chart_df[chart_x_col],
-                    y=chart_df['日均电价差'],
-                    name='日均电价差',
+                    y=chart_df['日均峰谷价差'],
+                    name='日均峰谷价差',
                     marker_color='rgb(55, 83, 109)'
                 )
                 if show_value_labels:
-                    bar_kwargs['text'] = [f"{x:.4f}" for x in chart_df['日均电价差']]
+                    bar_kwargs['text'] = [f"{x:.4f}" for x in chart_df['日均峰谷价差']]
                     bar_kwargs['textposition'] = 'auto'
                 if chart_hover_station:
                     bar_kwargs['customdata'] = chart_df[['站点名称']].to_numpy()
-                    bar_kwargs['hovertemplate'] = f"{chart_group_label}: %{{x}}<br>站点: %{{customdata[0]}}<br>日均电价差: %{{y:.4f}} 元/kWh<extra></extra>"
+                    bar_kwargs['hovertemplate'] = f"{chart_group_label}: %{{x}}<br>站点: %{{customdata[0]}}<br>日均峰谷价差: %{{y:.4f}} 元/kWh<extra></extra>"
 
                 fig_spread.add_trace(go.Bar(**bar_kwargs))
 
@@ -2750,7 +2878,7 @@ def main():
                 fig_spread.update_layout(
                     title=chart_title,
                     xaxis_title=chart_x_title,
-                    yaxis_title='日均电价差 (元/kWh)',
+                    yaxis_title='日均峰谷价差 (元/kWh)',
                     template='plotly_white',
                     height=500,
                     xaxis=dict(tickangle=45),
@@ -2856,17 +2984,17 @@ def main():
         # 储能参数配置
         st.sidebar.subheader("⚙️ 储能参数")
         P = st.sidebar.number_input(
-            "逆变器功率 (kW)",
+            "逆变器功率 (MW)",
             value=STORAGE_CONFIG['P'],
-            min_value=1000,
-            step=10000,
+            min_value=1,
+            step=10,
             help="储能逆变器额定功率"
         )
         battery_capacity = st.sidebar.number_input(
-            "电池容量 (kWh)",
+            "电池容量 (MWh)",
             value=STORAGE_CONFIG['battery_capacity'],
-            min_value=1000,
-            step=10000,
+            min_value=1,
+            step=10,
             help="电池总容量"
         )
         efficiency = st.sidebar.number_input(
@@ -2918,6 +3046,7 @@ def main():
                         'all_summaries': all_summaries,
                     }
                     st.session_state.opt_cache_key = cache_key
+                    params_changed = False  # 重置标记，确保立即显示结果
                 except Exception as e:
                     st.error(f"优化失败：{str(e)}")
                     st.exception(e)
@@ -2939,9 +3068,9 @@ def main():
             # 显示参数和收益摘要
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("逆变器功率", f"{P/1000:.0f} MW")
+                st.metric("逆变器功率", f"{P:.0f} MW")
             with col2:
-                st.metric("电池容量", f"{battery_capacity/1000:.0f} MWh")
+                st.metric("电池容量", f"{battery_capacity:.0f} MWh")
             with col3:
                 st.metric("年收益", f"{total_yearly_revenue:,.0f} 元")
             with col4:
