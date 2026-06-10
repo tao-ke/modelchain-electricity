@@ -12,7 +12,8 @@ import math
 import hashlib
 from collections import defaultdict
 import json
-
+import psycopg2
+import threading
 
 # 页面配置必须放在最前面
 st.set_page_config(
