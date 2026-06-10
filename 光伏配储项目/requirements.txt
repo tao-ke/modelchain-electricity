@@ -9,3 +9,4 @@ fonttools>=4.40.0
 plotly>=6.5.0
 pulp>=3.2.0
 highspy>=1.14.0
+threading>=1.0.0
